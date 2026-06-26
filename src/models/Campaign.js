@@ -13,6 +13,7 @@ const attachmentSchema = new mongoose.Schema(
 
 const campaignSchema = new mongoose.Schema(
   {
+    user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     name: { type: String, required: true, trim: true },
     subject: { type: String, required: true, trim: true },
     body: { type: String, required: true },
@@ -35,6 +36,7 @@ const campaignSchema = new mongoose.Schema(
     last_progress_at: { type: Date, default: null },
     started_at: { type: Date, default: null },
     completed_at: { type: Date, default: null },
+    quota_reserved: { type: Number, default: 0, min: 0 },
     attachments: [attachmentSchema],
   },
   { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } }

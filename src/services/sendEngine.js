@@ -10,7 +10,7 @@ import {
   markAccountLimitReached,
   recordAccountSend,
 } from './accountRotator.js';
-import { resolveDelayMs, sendConfig } from '../config/sendConfig.js';
+import { resolvePerAccountDelayMs, sendConfig } from '../config/sendConfig.js';
 import { classifySendError } from '../utils/errorClassifier.js';
 import {
   getWorkerId,
@@ -25,6 +25,11 @@ import {
   computeRetryDelay,
   syncCampaignCounters,
 } from './campaignTracker.js';
+import {
+  consumeSendQuota,
+  releaseUnsentQuotaSlot,
+  releaseCampaignQuota,
+} from './quotaService.js';
 
 const activeJobs = new Map();
 const workerId = getWorkerId();
@@ -96,7 +101,7 @@ async function processCampaign(campaignId) {
     const campaign = await Campaign.findById(campaignId);
     if (!campaign) return;
 
-    const accounts = await GmailAccount.find({ is_active: true });
+    const accounts = await GmailAccount.find({ user_id: campaign.user_id, is_active: true });
     if (!accounts.length) {
       campaign.status = 'failed';
       await campaign.save();
@@ -109,12 +114,14 @@ async function processCampaign(campaignId) {
       return;
     }
 
-    const rotator = new AccountRotator(accounts, {
-      preferredAccountId: campaign.gmail_account_id,
-      rotate: campaign.rotate_accounts !== false,
-    });
+    const useRotation = accounts.length > 1;
+    const perAccountDelayMs = resolvePerAccountDelayMs(campaign.send_delay_ms);
 
-    const delayMs = resolveDelayMs(campaign.send_delay_ms);
+    const rotator = new AccountRotator(accounts, {
+      preferredAccountId: useRotation ? null : campaign.gmail_account_id,
+      rotate: useRotation || campaign.rotate_accounts !== false,
+      perAccountDelayMs,
+    });
     const attachments = campaign.attachments || [];
     let emailsSinceSync = 0;
 
@@ -125,8 +132,8 @@ async function processCampaign(campaignId) {
       message: `Campaign "${campaign.name}" started`,
       details: {
         worker_id: workerId,
-        delay_ms: delayMs,
-        rotate_accounts: campaign.rotate_accounts,
+        per_account_delay_ms: perAccountDelayMs,
+        rotate_accounts: rotator.usesRotation,
         attachment_count: attachments.length,
         max_retries: sendConfig.maxRetriesPerRecipient,
         available_accounts: rotator.orderedAccounts.map((a) => a.email),
@@ -153,11 +160,12 @@ async function processCampaign(campaignId) {
           action: 'campaign_stop',
           message: 'Campaign sending stopped by user',
         });
+        await releaseCampaignQuota(campaign.user_id, campaignId);
         return;
       }
 
       if (current.worker_id && current.worker_id !== workerId) {
-        await sleep(delayMs);
+        await sleep(perAccountDelayMs);
         continue;
       }
 
@@ -169,18 +177,18 @@ async function processCampaign(campaignId) {
           next_retry_at: { $gt: new Date() },
         });
         if (pendingRetry > 0) {
-          await sleep(Math.min(delayMs, 5000));
+          await sleep(Math.min(perAccountDelayMs, 5000));
           continue;
         }
         break;
       }
 
       const claimToken = recipient.claim_token;
-      let account = await rotator.nextAvailable();
+      let account = await rotator.nextReadyAccount(sleep);
 
       if (!account) {
         await scheduleRecipientRetry(recipient._id, claimToken, {
-          nextRetryAt: new Date(Date.now() + delayMs * 5),
+          nextRetryAt: new Date(Date.now() + perAccountDelayMs * 5),
           errorMessage: 'All accounts exhausted — waiting for limits to reset',
         });
 
@@ -190,7 +198,7 @@ async function processCampaign(campaignId) {
           level: 'warning',
           action: 'account_limit_reached',
           message: 'All Gmail accounts have reached their send limits. Waiting before retry...',
-          details: { wait_ms: delayMs * 5 },
+          details: { wait_ms: perAccountDelayMs * 5 },
         });
 
         if (consecutiveNoAccount >= 10) {
@@ -208,7 +216,7 @@ async function processCampaign(campaignId) {
           return;
         }
 
-        await sleep(delayMs * 5);
+        await sleep(perAccountDelayMs * 5);
         continue;
       }
 
@@ -262,6 +270,9 @@ async function processCampaign(campaignId) {
         });
 
         await recordAccountSend(account);
+        rotator.markSent(account);
+
+        await consumeSendQuota(campaign.user_id, campaignId);
 
         const updated = await finalizeRecipient(recipient._id, claimToken, {
           status: 'sent',
@@ -314,7 +325,7 @@ async function processCampaign(campaignId) {
             details: { error: err.message, duration_ms: durationMs },
           });
 
-          const nextAccount = await rotator.nextAvailable();
+          const nextAccount = await rotator.nextReadyAccount(sleep);
           if (nextAccount && nextAccount._id.toString() !== prevAccountId) {
             await writeLog({
               campaignId,
@@ -379,6 +390,8 @@ async function processCampaign(campaignId) {
             claimed_by: null,
           });
 
+          await releaseUnsentQuotaSlot(campaign.user_id, campaignId);
+
           await writeLog({
             campaignId,
             recipientId: recipient._id,
@@ -403,7 +416,7 @@ async function processCampaign(campaignId) {
         }
       }
 
-      await sleep(delayMs);
+      // Per-account cooldown is enforced in nextReadyAccount; no extra global delay.
     }
 
     await syncCampaignCounters(campaignId);
@@ -444,6 +457,8 @@ async function processCampaign(campaignId) {
         },
       });
     }
+
+    await releaseCampaignQuota(campaign.user_id, campaignId);
   } finally {
     try {
       await releaseCampaignLock(campaignId, workerId);

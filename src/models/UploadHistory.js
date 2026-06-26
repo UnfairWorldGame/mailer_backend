@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 
 const uploadHistorySchema = new mongoose.Schema(
   {
+    user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     filename: { type: String, required: true },
     total_rows: { type: Number, default: 0 },
     inserted: { type: Number, default: 0 },

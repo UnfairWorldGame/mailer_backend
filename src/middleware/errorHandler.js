@@ -5,6 +5,10 @@ export function notFoundHandler(_req, res) {
 export function errorHandler(err, _req, res, _next) {
   console.error('[API Error]', err);
 
+  if (err.name === 'QuotaError') {
+    return res.status(err.status || 402).json({ error: err.message, code: err.code });
+  }
+
   if (err.name === 'ValidationError') {
     return res.status(400).json({ error: err.message });
   }

@@ -2,8 +2,9 @@ import mongoose from 'mongoose';
 
 const gmailAccountSchema = new mongoose.Schema(
   {
+    user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     label: { type: String, required: true, trim: true },
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    email: { type: String, required: true, lowercase: true, trim: true },
     app_password: { type: String, required: true },
     is_active: { type: Boolean, default: true },
     daily_send_limit: { type: Number, default: null },
@@ -18,5 +19,7 @@ const gmailAccountSchema = new mongoose.Schema(
   },
   { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } }
 );
+
+gmailAccountSchema.index({ user_id: 1, email: 1 }, { unique: true });
 
 export default mongoose.model('GmailAccount', gmailAccountSchema);

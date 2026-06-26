@@ -79,11 +79,16 @@ export async function recordAccountSend(account) {
 }
 
 export class AccountRotator {
-  constructor(accounts, { preferredAccountId = null, rotate = true } = {}) {
+  constructor(
+    accounts,
+    { preferredAccountId = null, rotate = true, perAccountDelayMs = sendConfig.perAccountDelayMs } = {}
+  ) {
     this.accounts = accounts;
     this.rotate = rotate;
     this.preferredAccountId = preferredAccountId?.toString() ?? null;
+    this.perAccountDelayMs = perAccountDelayMs;
     this.cursor = 0;
+    this.lastSendAt = new Map();
     this._ordered = this._buildOrder();
   }
 
@@ -94,6 +99,10 @@ export class AccountRotator {
       return preferred ? [preferred] : active;
     }
 
+    if (this.rotate && active.length > 1) {
+      return active;
+    }
+
     if (this.preferredAccountId) {
       const preferredIdx = active.findIndex((a) => a._id.toString() === this.preferredAccountId);
       if (preferredIdx > 0) {
@@ -101,6 +110,22 @@ export class AccountRotator {
       }
     }
     return active;
+  }
+
+  _lastSendMs(account) {
+    const id = account._id.toString();
+    const session = this.lastSendAt.get(id) ?? 0;
+    const persisted = account.last_sent_at ? new Date(account.last_sent_at).getTime() : 0;
+    return Math.max(session, persisted);
+  }
+
+  cooldownRemainingMs(account) {
+    const elapsed = Date.now() - this._lastSendMs(account);
+    return Math.max(0, this.perAccountDelayMs - elapsed);
+  }
+
+  markSent(account) {
+    this.lastSendAt.set(account._id.toString(), Date.now());
   }
 
   async nextAvailable() {
@@ -119,8 +144,77 @@ export class AccountRotator {
     return null;
   }
 
+  /**
+   * Pick the next account for sending, alternating when multiple accounts exist.
+   * Waits until the chosen account has cooled down (per-account delay).
+   */
+  async nextReadyAccount(sleepFn) {
+    if (!this._ordered.length) return null;
+
+    const total = this._ordered.length;
+    const useRotation = this.rotate && total > 1;
+
+    if (!useRotation) {
+      const account = this._ordered[0];
+      await resetAccountCountersIfNeeded(account);
+      if (!isAccountAvailable(account)) return null;
+      const wait = this.cooldownRemainingMs(account);
+      if (wait > 0) await sleepFn(wait);
+      return account;
+    }
+
+    for (let attempt = 0; attempt < total + 1; attempt++) {
+      let readyAccount = null;
+      let readyIdx = -1;
+      let soonestWait = Infinity;
+      let soonestAccount = null;
+      let soonestIdx = -1;
+
+      for (let i = 0; i < total; i++) {
+        const idx = (this.cursor + i) % total;
+        const account = this._ordered[idx];
+        await resetAccountCountersIfNeeded(account);
+        if (!isAccountAvailable(account)) continue;
+
+        const wait = this.cooldownRemainingMs(account);
+        if (wait === 0) {
+          readyAccount = account;
+          readyIdx = idx;
+          break;
+        }
+        if (wait < soonestWait) {
+          soonestWait = wait;
+          soonestAccount = account;
+          soonestIdx = idx;
+        }
+      }
+
+      if (readyAccount) {
+        this.cursor = (readyIdx + 1) % total;
+        return readyAccount;
+      }
+
+      if (!soonestAccount || !Number.isFinite(soonestWait)) {
+        return null;
+      }
+
+      await sleepFn(soonestWait);
+      await resetAccountCountersIfNeeded(soonestAccount);
+      if (isAccountAvailable(soonestAccount) && this.cooldownRemainingMs(soonestAccount) === 0) {
+        this.cursor = (soonestIdx + 1) % total;
+        return soonestAccount;
+      }
+    }
+
+    return null;
+  }
+
   get orderedAccounts() {
     return this._ordered;
+  }
+
+  get usesRotation() {
+    return this.rotate && this._ordered.length > 1;
   }
 }
 

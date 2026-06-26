@@ -4,8 +4,11 @@ import Contact from '../models/Contact.js';
 import GmailAccount from '../models/GmailAccount.js';
 import UploadHistory from '../models/UploadHistory.js';
 import SendLog from '../models/SendLog.js';
+import { ownerFilter } from '../utils/userScope.js';
 
-export async function getAnalyticsOverview() {
+export async function getAnalyticsOverview(userId) {
+  const owner = ownerFilter(userId);
+
   const [
     campaigns,
     contacts,
@@ -16,6 +19,7 @@ export async function getAnalyticsOverview() {
     recentActivity,
   ] = await Promise.all([
     Campaign.aggregate([
+      { $match: owner },
       {
         $group: {
           _id: '$status',
@@ -25,14 +29,37 @@ export async function getAnalyticsOverview() {
         },
       },
     ]),
-    Contact.countDocuments(),
-    GmailAccount.countDocuments({ is_active: true }),
-    UploadHistory.countDocuments(),
+    Contact.countDocuments(owner),
+    GmailAccount.countDocuments({ ...owner, is_active: true }),
+    UploadHistory.countDocuments(owner),
     CampaignRecipient.aggregate([
+      {
+        $lookup: {
+          from: 'campaigns',
+          localField: 'campaign_id',
+          foreignField: '_id',
+          as: 'campaign',
+        },
+      },
+      { $unwind: '$campaign' },
+      { $match: { 'campaign.user_id': userId } },
       { $group: { _id: '$status', count: { $sum: 1 } } },
     ]),
-    GmailAccount.find().select('label email sends_today total_sent limit_reached is_active').lean(),
-    SendLog.find().sort({ created_at: -1 }).limit(10).lean(),
+    GmailAccount.find(owner).select('label email sends_today total_sent limit_reached is_active').lean(),
+    SendLog.aggregate([
+      {
+        $lookup: {
+          from: 'campaigns',
+          localField: 'campaign_id',
+          foreignField: '_id',
+          as: 'campaign',
+        },
+      },
+      { $unwind: '$campaign' },
+      { $match: { 'campaign.user_id': userId } },
+      { $sort: { created_at: -1 } },
+      { $limit: 10 },
+    ]),
   ]);
 
   const byStatus = Object.fromEntries(campaigns.map((c) => [c._id, c]));
@@ -84,13 +111,24 @@ export async function getAnalyticsOverview() {
   };
 }
 
-export async function getEmailTimeSeries(days = 7) {
+export async function getEmailTimeSeries(userId, days = 7) {
   const since = new Date();
   since.setDate(since.getDate() - days);
   since.setHours(0, 0, 0, 0);
 
+  const campaignMatch = { 'campaign.user_id': userId };
+
   const sent = await CampaignRecipient.aggregate([
-    { $match: { status: 'sent', sent_at: { $gte: since } } },
+    {
+      $lookup: {
+        from: 'campaigns',
+        localField: 'campaign_id',
+        foreignField: '_id',
+        as: 'campaign',
+      },
+    },
+    { $unwind: '$campaign' },
+    { $match: { ...campaignMatch, status: 'sent', sent_at: { $gte: since } } },
     {
       $group: {
         _id: { $dateToString: { format: '%Y-%m-%d', date: '$sent_at' } },
@@ -101,7 +139,16 @@ export async function getEmailTimeSeries(days = 7) {
   ]);
 
   const failed = await CampaignRecipient.aggregate([
-    { $match: { status: 'failed', updated_at: { $gte: since } } },
+    {
+      $lookup: {
+        from: 'campaigns',
+        localField: 'campaign_id',
+        foreignField: '_id',
+        as: 'campaign',
+      },
+    },
+    { $unwind: '$campaign' },
+    { $match: { ...campaignMatch, status: 'failed', updated_at: { $gte: since } } },
     {
       $group: {
         _id: { $dateToString: { format: '%Y-%m-%d', date: '$updated_at' } },

@@ -16,12 +16,22 @@ import accountsRouter from './routes/accounts.js';
 import uploadsRouter from './routes/uploads.js';
 import campaignsRouter from './routes/campaigns.js';
 import analyticsRouter from './routes/analytics.js';
+import aiRouter from './routes/ai.js';
+import authRouter from './routes/auth.js';
+import adminRouter from './routes/admin.js';
+import inquiriesRouter from './routes/inquiries.js';
+import billingRouter from './routes/billing.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+function normalizeOrigin(url) {
+  if (!url) return null;
+  return url.replace(/\/+$/, '');
+}
+
 const allowedOrigins = [
-  process.env.FRONTEND_URL,
+  normalizeOrigin(process.env.FRONTEND_URL),
   'http://localhost:5173',
   'http://localhost:4173',
 ].filter(Boolean);
@@ -30,7 +40,7 @@ app.set('trust proxy', 1);
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin) || process.env.NODE_ENV !== 'production') {
+    if (!origin || allowedOrigins.includes(normalizeOrigin(origin)) || process.env.NODE_ENV !== 'production') {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
@@ -54,10 +64,15 @@ app.get('/api/health', async (_req, res) => {
   });
 });
 
+app.use('/api/auth', authRouter);
+app.use('/api/inquiries', inquiriesRouter);
+app.use('/api/billing', billingRouter);
+app.use('/api/admin', adminRouter);
 app.use('/api/accounts', accountsRouter);
 app.use('/api/uploads', uploadsRouter);
 app.use('/api/campaigns', campaignsRouter);
 app.use('/api/analytics', analyticsRouter);
+app.use('/api/ai', aiRouter);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
@@ -73,7 +88,7 @@ async function start() {
   await resumeInterruptedCampaigns();
 
   const server = app.listen(PORT, () => {
-    console.log(`Mailer API running on http://localhost:${PORT}`);
+    console.log(`MAILIQ API running on http://localhost:${PORT}`);
   });
 
   server.on('error', (err) => {

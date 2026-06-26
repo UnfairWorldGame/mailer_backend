@@ -1,9 +1,12 @@
 import { Router } from 'express';
 import mongoose from 'mongoose';
 import GmailAccount from '../models/GmailAccount.js';
+import { requireAuth } from '../middleware/auth.js';
 import { toApiDoc, toApiDocs } from '../utils/apiTransform.js';
+import { ownerFilter } from '../utils/userScope.js';
 
 const router = Router();
+router.use(requireAuth);
 
 function publicAccount(doc) {
   const api = toApiDoc(doc);
@@ -11,9 +14,9 @@ function publicAccount(doc) {
   return api;
 }
 
-router.get('/', async (_req, res, next) => {
+router.get('/', async (req, res, next) => {
   try {
-    const accounts = await GmailAccount.find().sort({ created_at: -1 });
+    const accounts = await GmailAccount.find(ownerFilter(req.user.id)).sort({ created_at: -1 });
     res.json(toApiDocs(accounts, () => ({})).map((a) => {
       delete a.app_password;
       return a;
@@ -28,7 +31,7 @@ router.get('/:id', async (req, res, next) => {
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(404).json({ error: 'Account not found' });
     }
-    const account = await GmailAccount.findById(req.params.id);
+    const account = await GmailAccount.findOne(ownerFilter(req.user.id, { _id: req.params.id }));
     if (!account) return res.status(404).json({ error: 'Account not found' });
     res.json(publicAccount(account));
   } catch (err) {
@@ -45,6 +48,7 @@ router.post('/', async (req, res, next) => {
     }
 
     const account = await GmailAccount.create({
+      user_id: req.user.id,
       label: label.trim(),
       email: email.trim().toLowerCase(),
       app_password: app_password.trim(),
@@ -66,7 +70,7 @@ router.put('/:id', async (req, res, next) => {
       return res.status(404).json({ error: 'Account not found' });
     }
 
-    const account = await GmailAccount.findById(req.params.id);
+    const account = await GmailAccount.findOne(ownerFilter(req.user.id, { _id: req.params.id }));
     if (!account) return res.status(404).json({ error: 'Account not found' });
 
     const { label, email, app_password, is_active, daily_send_limit } = req.body;
@@ -92,7 +96,7 @@ router.delete('/:id', async (req, res, next) => {
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(404).json({ error: 'Account not found' });
     }
-    const result = await GmailAccount.findByIdAndDelete(req.params.id);
+    const result = await GmailAccount.findOneAndDelete(ownerFilter(req.user.id, { _id: req.params.id }));
     if (!result) return res.status(404).json({ error: 'Account not found' });
     res.json({ message: 'Account deleted' });
   } catch (err) {
