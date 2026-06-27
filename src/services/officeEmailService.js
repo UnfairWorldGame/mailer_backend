@@ -1,5 +1,6 @@
 import { createTransporter } from './emailService.js';
 import { getAdminEmails } from '../utils/adminAccess.js';
+import { getPrimaryFrontendUrl } from '../config/origins.js';
 
 function getSmtpConfig() {
   const email = process.env.PASSWORD_RESET_SMTP_EMAIL?.trim().toLowerCase();
@@ -40,7 +41,7 @@ function formatNumber(value) {
 }
 
 function getFrontendUrl() {
-  return (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
+  return getPrimaryFrontendUrl();
 }
 
 async function sendUserEmail({ to, subject, textLines, htmlBody, replyTo }) {
@@ -270,46 +271,94 @@ export async function sendCreditPurchaseTeamNotification({ name, email, phone, p
   });
 }
 
-export async function sendOfficeInquiry({ subject, textLines, htmlSections, replyTo }) {
-  const smtp = getSmtpConfig();
-  const to = getContactInboxEmail();
+export async function sendContactFormConfirmationEmail({ name, email, message }) {
   const fromName = process.env.PASSWORD_RESET_FROM_NAME?.trim() || 'MAILIQ';
-  const textBody = textLines.join('\n');
+  const supportEmail = getContactInboxEmail();
+  const safeName = escapeHtml(name);
+
+  const subject = `${fromName} — we received your message`;
+
+  const textLines = [
+    `Hi ${name},`,
+    '',
+    `Thank you for contacting ${fromName}. We have received your message and will get back to you soon.`,
+    '',
+    'Your message:',
+    message,
+    '',
+    `If you need to follow up sooner, reply to this email or write to ${supportEmail}.`,
+    '',
+    `— The ${fromName} Team`,
+  ];
+
+  const htmlBody = `
+    <div style="font-family:Inter,system-ui,sans-serif;max-width:560px;margin:0 auto;padding:24px">
+      <h2 style="color:#312e81;margin:0 0 8px">Message received</h2>
+      <p style="color:#64748b;margin:0 0 24px;font-size:14px">Official confirmation from ${escapeHtml(fromName)}</p>
+      <p style="color:#475569;line-height:1.6">Hi ${safeName},</p>
+      <p style="color:#475569;line-height:1.6">
+        Thank you for reaching out. We have received your message and our team will get back to you soon.
+      </p>
+      <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:16px;margin:24px 0">
+        <p style="margin:0 0 8px;color:#1e293b;font-weight:600">Your message</p>
+        <p style="margin:0;color:#475569;line-height:1.6;white-space:pre-wrap">${escapeHtml(message)}</p>
+      </div>
+      <p style="color:#94a3b8;font-size:13px;line-height:1.5">
+        Need to follow up sooner? Reply to this email or contact us at
+        <a href="mailto:${escapeHtml(supportEmail)}" style="color:#6366f1">${escapeHtml(supportEmail)}</a>.
+      </p>
+      <p style="color:#94a3b8;font-size:13px;margin-top:24px">— The ${escapeHtml(fromName)} Team</p>
+    </div>
+  `;
+
+  return sendUserEmail({
+    to: email,
+    subject,
+    textLines,
+    htmlBody,
+  });
+}
+
+export async function sendOfficeInquiry({ subject, textLines, htmlSections, replyTo }) {
+  const recipients = getTeamNotificationRecipients();
+  const fromName = process.env.PASSWORD_RESET_FROM_NAME?.trim() || 'MAILIQ';
 
   const htmlBody = `
     <div style="font-family:Inter,system-ui,sans-serif;max-width:560px;margin:0 auto;padding:24px">
       <h2 style="color:#312e81;margin:0 0 16px">${escapeHtml(subject)}</h2>
+      <p style="color:#64748b;margin:0 0 24px;font-size:14px">${escapeHtml(fromName)} · ${escapeHtml(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }))} IST</p>
       ${htmlSections.map(({ label, value }) => `
         <p style="margin:0 0 12px;color:#475569;line-height:1.6">
           <strong style="color:#1e293b">${escapeHtml(label)}:</strong><br>
           ${escapeHtml(value).replace(/\n/g, '<br>')}
         </p>
       `).join('')}
+      ${replyTo ? `<p style="color:#94a3b8;font-size:13px;margin-top:24px">Reply to this email to contact the sender directly.</p>` : ''}
     </div>
   `;
 
+  if (!recipients.length) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.log(`[inquiry] No recipients configured. Subject: ${subject}\n${textLines.join('\n')}`);
+      return { sent: false, devLog: true };
+    }
+    return { sent: false, error: 'No team notification recipients configured' };
+  }
+
+  const smtp = getSmtpConfig();
   if (!smtp) {
     if (process.env.NODE_ENV !== 'production') {
-      console.log(`[inquiry] To: ${to}\nSubject: ${subject}\n${textBody}`);
+      console.log(`[inquiry] To: ${recipients.join(', ')}\nSubject: ${subject}\n${textLines.join('\n')}`);
       return { sent: false, devLog: true };
     }
     return { sent: false, error: 'Email service is not configured' };
   }
 
-  try {
-    const transporter = createTransporter(smtp.email, smtp.appPassword);
-    await transporter.sendMail({
-      from: `"${fromName}" <${smtp.email}>`,
-      to,
-      replyTo: replyTo || undefined,
-      subject,
-      text: textBody,
-      html: htmlBody,
-    });
-    return { sent: true };
-  } catch (err) {
-    const message = err?.message || 'Failed to send email';
-    console.error(`[inquiry] Send failed to ${to}:`, message);
-    return { sent: false, error: message };
-  }
+  return sendUserEmail({
+    to: recipients.join(', '),
+    replyTo,
+    subject,
+    textLines,
+    htmlBody,
+  });
 }

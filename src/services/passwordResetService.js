@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { createTransporter } from './emailService.js';
+import { getPrimaryFrontendUrl } from '../config/origins.js';
 
 const RESET_EXPIRY_MS = 60 * 60 * 1000;
 
@@ -31,7 +32,7 @@ function getSmtpConfig() {
 }
 
 export function buildResetUrl(rawToken) {
-  const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
+  const frontendUrl = getPrimaryFrontendUrl();
   return `${frontendUrl}/reset-password?token=${encodeURIComponent(rawToken)}`;
 }
 

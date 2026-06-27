@@ -1,0 +1,22 @@
+# Build + push image only (no Cloud Run deploy)
+# Run: gcloud builds submit --config cloudbuild.build-only.yaml .
+
+substitutions:
+  _REGION: asia-south1
+  _AR_REPO: mailiq
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/mailer-api:latest
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/mailer-api:latest
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPO}/mailer-api:latest

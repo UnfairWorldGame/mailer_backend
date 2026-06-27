@@ -3,6 +3,7 @@ import rateLimit from 'express-rate-limit';
 import { requireAuth } from '../middleware/auth.js';
 import {
   sendOfficeInquiry,
+  sendContactFormConfirmationEmail,
   sendCreditPurchaseRequestConfirmationEmail,
   sendCreditPurchaseTeamNotification,
 } from '../services/officeEmailService.js';
@@ -82,6 +83,8 @@ router.post('/contact', inquiryLimiter, async (req, res, next) => {
     if (!result.sent && !result.devLog) {
       return res.status(503).json({ error: result.error || 'Could not send your message. Please email us directly.' });
     }
+
+    await sendContactFormConfirmationEmail({ name, email, message });
 
     res.json({ message: 'Your message has been sent. We will get back to you soon.' });
   } catch (err) {

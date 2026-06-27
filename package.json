@@ -4,6 +4,9 @@
   "description": "Email Campaign Manager API with MongoDB Atlas",
   "main": "src/index.js",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",

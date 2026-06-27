@@ -12,6 +12,7 @@ import { connectDB } from './db/connect.js';
 import { resumeInterruptedCampaigns } from './services/sendEngine.js';
 import { applySecurity } from './middleware/security.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
+import { getAllowedOrigins, normalizeOrigin } from './config/origins.js';
 import accountsRouter from './routes/accounts.js';
 import uploadsRouter from './routes/uploads.js';
 import campaignsRouter from './routes/campaigns.js';
@@ -24,27 +25,19 @@ import billingRouter from './routes/billing.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const HOST = process.env.HOST || '0.0.0.0';
 
-function normalizeOrigin(url) {
-  if (!url) return null;
-  return url.replace(/\/+$/, '');
-}
-
-const allowedOrigins = [
-  normalizeOrigin(process.env.FRONTEND_URL),
-  'http://localhost:5173',
-  'http://localhost:4173',
-].filter(Boolean);
+const allowedOrigins = getAllowedOrigins();
 
 app.set('trust proxy', 1);
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(normalizeOrigin(origin)) || process.env.NODE_ENV !== 'production') {
+    if (!origin || allowedOrigins.includes(normalizeOrigin(origin))) {
       callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
+      return;
     }
+    callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
 }));
@@ -87,8 +80,11 @@ async function start() {
 
   await resumeInterruptedCampaigns();
 
-  const server = app.listen(PORT, () => {
-    console.log(`MAILIQ API running on http://localhost:${PORT}`);
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`MAILIQ API running on http://${HOST}:${PORT}`);
+    if (allowedOrigins.length) {
+      console.log(`CORS origins: ${allowedOrigins.join(', ')}`);
+    }
   });
 
   server.on('error', (err) => {
