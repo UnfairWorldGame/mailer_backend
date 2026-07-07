@@ -20,10 +20,16 @@ import {
 const router = Router();
 router.use(requireAuth);
 
+// Bound worksheet parsing so a small compressed .xlsx cannot decompress into a
+// giant sheet and exhaust memory (zip-bomb / billion-cells DoS).
+const MAX_IMPORT_ROWS = 50000;
+const MAX_BULK_DELETE_IDS = 10000;
+
 function parseContactsFromFile(filePath) {
   let workbook;
   try {
-    workbook = XLSX.readFile(filePath);
+    // sheetRows caps how many rows are materialized regardless of declared size.
+    workbook = XLSX.readFile(filePath, { sheetRows: MAX_IMPORT_ROWS + 1 });
   } catch {
     throw new Error('Could not read file. Make sure it is a valid Excel or CSV file.');
   }
@@ -34,6 +40,13 @@ function parseContactsFromFile(filePath) {
 
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+
+  if (rows.length > MAX_IMPORT_ROWS) {
+    throw new Error(
+      `File has too many rows. Please split it into files of at most ${MAX_IMPORT_ROWS.toLocaleString()} rows.`
+    );
+  }
+
   return parseContactsFromRowsDetailed(rows);
 }
 
@@ -173,6 +186,12 @@ router.post('/contacts/bulk-delete', async (req, res, next) => {
 
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: 'Provide contact ids or set all to true' });
+    }
+
+    if (ids.length > MAX_BULK_DELETE_IDS) {
+      return res.status(400).json({
+        error: `Too many ids in one request (max ${MAX_BULK_DELETE_IDS}). Use "all: true" to clear everything.`,
+      });
     }
 
     const result = await deleteContactsByIds(ids, req.user.id);

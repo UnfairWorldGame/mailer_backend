@@ -6,6 +6,7 @@ import { toApiDoc } from '../utils/apiTransform.js';
 import { resolveUserRole } from '../utils/adminAccess.js';
 import { getQuotaForUser } from '../services/quotaService.js';
 import { validatePassword } from '../utils/passwordValidation.js';
+import { isValidEmail } from '../utils/contactParser.js';
 import {
   applyPasswordReset,
   hashResetToken,
@@ -14,9 +15,8 @@ import {
 
 const router = Router();
 
-const RESET_SENT_MESSAGE = 'Password reset instructions have been sent to your email.';
-
-const USER_NOT_FOUND_MESSAGE = 'No account found with this email address.';
+const RESET_SENT_MESSAGE =
+  'If an account exists for that email, password reset instructions have been sent.';
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -55,6 +55,10 @@ router.post('/register', async (req, res, next) => {
 
     if (!name?.trim() || !email?.trim() || !password) {
       return res.status(400).json({ error: 'Name, email, and password are required' });
+    }
+
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: 'Enter a valid email address' });
     }
 
     if (confirmPassword !== undefined && password !== confirmPassword) {
@@ -124,12 +128,11 @@ router.post('/forgot-password', forgotPasswordLimiter, async (req, res, next) =>
 
     const user = await User.findOne({ email });
 
-    if (!user) {
-      return res.status(404).json({ error: USER_NOT_FOUND_MESSAGE });
-    }
-
-    if (user.is_active === false) {
-      return res.status(403).json({ error: 'Account disabled. Contact support.' });
+    // Always return the same generic response regardless of whether the account
+    // exists or is active — otherwise the endpoint leaks which emails are
+    // registered (account enumeration). Do the real work only when eligible.
+    if (!user || user.is_active === false) {
+      return res.json({ message: RESET_SENT_MESSAGE });
     }
 
     const rawToken = await user.issuePasswordResetToken();
@@ -139,6 +142,8 @@ router.post('/forgot-password', forgotPasswordLimiter, async (req, res, next) =>
       return res.json({ message: RESET_SENT_MESSAGE });
     }
 
+    // Delivery failed — surface the dev link locally to keep DX, but never
+    // reveal account existence or SMTP internals in production.
     if (process.env.NODE_ENV !== 'production' && result.devLink) {
       return res.json({
         message: RESET_SENT_MESSAGE,

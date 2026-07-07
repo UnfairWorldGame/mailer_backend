@@ -1,13 +1,39 @@
 import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
-import { resolveUserRole } from '../utils/adminAccess.js';
+import { resolveUserRole, isAdminUser } from '../utils/adminAccess.js';
+
+// Known-insecure values that must never be used as a signing secret.
+// The first is the famous jwt.io sample token that was shipped in .env.
+const KNOWN_WEAK_SECRETS = new Set([
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsInJvbGUiOiJzdXBlcl9hZG1pbiJ9.21_faTCVLa8bq_sqNAfDK7oYe1rW1M3xyIRqHX8_Fys',
+  'change_this_to_a_long_random_secret',
+  'secret',
+  'changeme',
+]);
+
+const MIN_SECRET_LENGTH = 32;
 
 function getJwtSecret() {
   const secret = process.env.JWT_SECRET?.trim();
   if (!secret) {
     throw new Error('JWT_SECRET environment variable is required');
   }
+  if (secret.length < MIN_SECRET_LENGTH) {
+    throw new Error(
+      `JWT_SECRET is too weak (${secret.length} chars). Use at least ${MIN_SECRET_LENGTH} random characters, e.g. \`node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"\`.`
+    );
+  }
+  if (KNOWN_WEAK_SECRETS.has(secret)) {
+    throw new Error(
+      'JWT_SECRET is set to a well-known/default value and is publicly guessable. Generate a fresh random secret and rotate it immediately.'
+    );
+  }
   return secret;
+}
+
+// Fail fast at startup rather than on the first authenticated request.
+export function assertJwtSecret() {
+  getJwtSecret();
 }
 
 export function signToken(userId) {
@@ -20,7 +46,10 @@ export async function requireAuth(req, res, next) {
   try {
     const header = req.headers.authorization || '';
     let token = header.startsWith('Bearer ') ? header.slice(7) : null;
-    if (!token && req.query?.token) {
+    // Query-string tokens leak into logs/history/Referer. Only accept them for
+    // safe GET requests (e.g. attachment <img>/download previews that cannot set
+    // an Authorization header), never for state-changing methods.
+    if (!token && req.method === 'GET' && typeof req.query?.token === 'string') {
       token = req.query.token;
     }
 
@@ -35,7 +64,9 @@ export async function requireAuth(req, res, next) {
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
 
-    if (user.is_active === false) {
+    // Env-listed admins (ADMIN_EMAILS) are a break-glass account and must never
+    // be lockable via the DB is_active flag, or another admin could disable them.
+    if (user.is_active === false && !isAdminUser(user)) {
       return res.status(403).json({ error: 'Account disabled' });
     }
 

@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$PROJECT_ID = "artful-line-417208"
+$PROJECT_ID = "rosy-etching-417006"
 $REGION = "asia-south1"
 $SERVICE = "mailiq-api"
 

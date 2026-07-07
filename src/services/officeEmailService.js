@@ -148,6 +148,62 @@ export async function sendCreditGrantConfirmationEmail(user, grant) {
   });
 }
 
+export async function sendFreeCreditGrantEmail(user, { creditsGranted, balanceAfter, reason }) {
+  const fromName = process.env.PASSWORD_RESET_FROM_NAME?.trim() || 'MAILIQ';
+  const supportEmail = getContactInboxEmail();
+  const dashboardUrl = `${getFrontendUrl()}/dashboard`;
+  const safeName = escapeHtml(user.name);
+  const credits = formatNumber(creditsGranted);
+  const balance = formatNumber(balanceAfter);
+  const reasonLine = reason ? `Reason: ${reason}` : null;
+
+  const subject = `🎉 ${credits} free credits added to your ${fromName} account`;
+
+  const textLines = [
+    '🎉 Congratulations!',
+    '',
+    `The ${fromName} Team has added ${credits} free credits to your account. Your new credit balance has been ` +
+      `updated successfully. Thank you for using ${fromName}—we hope these credits help you create and send ` +
+      'even more successful email campaigns!',
+    '',
+    `New balance: ${balance} credits.`,
+    ...(reasonLine ? ['', reasonLine] : []),
+    '',
+    `Open your dashboard: ${dashboardUrl}`,
+    '',
+    `Questions? Reply to this email or contact us at ${supportEmail}.`,
+    '',
+    `— The ${fromName} Team`,
+  ];
+
+  const htmlBody = `
+    <div style="font-family:Inter,system-ui,sans-serif;max-width:560px;margin:0 auto;padding:24px">
+      <h2 style="color:#312e81;margin:0 0 8px">🎉 Congratulations!</h2>
+      <p style="color:#64748b;margin:0 0 24px;font-size:14px">A gift from the ${escapeHtml(fromName)} Team</p>
+      <p style="color:#475569;line-height:1.6">Hi ${safeName},</p>
+      <p style="color:#475569;line-height:1.6">
+        The ${escapeHtml(fromName)} Team has added <strong style="color:#1e293b">${credits} free credits</strong> to your account.
+        Your new credit balance has been updated successfully. Thank you for using ${escapeHtml(fromName)}—we hope these
+        credits help you create and send even more successful email campaigns!
+      </p>
+      <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:16px;margin:24px 0">
+        <p style="margin:0;color:#1e293b;font-weight:600">New balance: ${balance} credits</p>
+        ${reasonLine ? `<p style="margin:8px 0 0;color:#475569"><strong>Reason:</strong> ${escapeHtml(reason)}</p>` : ''}
+      </div>
+      <p style="margin:28px 0">
+        <a href="${dashboardUrl}" style="background:#ea580c;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:600;display:inline-block">Go to dashboard</a>
+      </p>
+      <p style="color:#94a3b8;font-size:13px;line-height:1.5">
+        Questions? Reply to this email or contact us at
+        <a href="mailto:${escapeHtml(supportEmail)}" style="color:#6366f1">${escapeHtml(supportEmail)}</a>.
+      </p>
+      <p style="color:#94a3b8;font-size:13px;margin-top:24px">— The ${escapeHtml(fromName)} Team</p>
+    </div>
+  `;
+
+  return sendUserEmail({ to: user.email, subject, textLines, htmlBody });
+}
+
 export async function sendCreditPurchaseRequestConfirmationEmail({ name, email, phone, packLabel, price, mails }) {
   const fromName = process.env.PASSWORD_RESET_FROM_NAME?.trim() || 'MAILIQ';
   const supportEmail = getContactInboxEmail();

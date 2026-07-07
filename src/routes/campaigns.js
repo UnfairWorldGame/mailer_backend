@@ -8,6 +8,7 @@ import Contact from '../models/Contact.js';
 import GmailAccount from '../models/GmailAccount.js';
 import SendLog from '../models/SendLog.js';
 import { pdfUpload } from '../middleware/pdfUpload.js';
+import { hasPdfMagicBytes } from '../utils/fileSignature.js';
 import { startCampaignSend, isCampaignRunning } from '../services/sendEngine.js';
 import { getCampaignLogs, getCampaignLogCount, getRecipientLogs } from '../services/logService.js';
 import { getCampaignProgress, resetFailedRecipients, syncCampaignCounters } from '../services/campaignTracker.js';
@@ -327,6 +328,7 @@ router.delete('/:id', async (req, res, next) => {
       fs.unlink(att.file_path, () => {});
     }
 
+    await releaseCampaignQuota(req.user.id, campaign._id);
     await CampaignRecipient.deleteMany({ campaign_id: campaign._id });
     await SendLog.deleteMany({ campaign_id: campaign._id });
     await Campaign.findByIdAndDelete(campaign._id);
@@ -373,6 +375,12 @@ router.post('/:id/attachments', pdfUpload.array('files', 10), async (req, res, n
       return res.status(400).json({ error: 'No PDF files uploaded' });
     }
 
+    const validityChecks = await Promise.all(req.files.map((f) => hasPdfMagicBytes(f.path)));
+    if (validityChecks.some((ok) => !ok)) {
+      for (const f of req.files) fs.unlink(f.path, () => {});
+      return res.status(400).json({ error: 'One or more files are not valid PDFs' });
+    }
+
     const newAttachments = req.files.map((file) => ({
       original_name: file.originalname,
       stored_name: file.filename,
@@ -412,8 +420,15 @@ router.get('/:id/attachments/:attachmentId/download', async (req, res, next) => 
       return res.status(404).json({ error: 'File not found on server' });
     }
 
+    // original_name is user-supplied (the uploaded file's name) — strip quotes/CR/LF
+    // before embedding it in a header value, and percent-encode the UTF-8 variant.
+    const rawName = attachment.original_name || 'attachment';
+    const asciiName = rawName.replace(/["\r\n]/g, '');
     res.setHeader('Content-Type', attachment.mime_type || 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="${attachment.original_name}"`);
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(rawName)}`
+    );
     res.sendFile(path.resolve(attachment.file_path));
   } catch (err) {
     next(err);
@@ -490,7 +505,9 @@ router.post('/:id/retry-failed', async (req, res, next) => {
       );
     }
 
-    const retried = await resetFailedRecipients(campaign._id);
+    const retried = await resetFailedRecipients(campaign._id, {
+      maxRetries: sendConfig.maxRetriesPerRecipient,
+    });
 
     if (retried === 0) {
       return res.status(400).json({ error: 'No failed recipients to retry' });
@@ -538,7 +555,7 @@ router.post('/:id/send', async (req, res, next) => {
 
     const activeAccounts = await GmailAccount.countDocuments(ownerFilter(req.user.id, { is_active: true }));
     if (activeAccounts === 0) {
-      return res.status(400).json({ error: 'No active Gmail accounts available. Add at least one account.' });
+      return res.status(400).json({ error: 'Add and activate a Gmail sending account first.', code: 'NO_ACTIVE_GMAIL_ACCOUNT' });
     }
 
     if (!campaign.gmail_account_id && campaign.rotate_accounts === false) {
@@ -616,7 +633,7 @@ router.post('/:id/resume', async (req, res, next) => {
 
     const activeAccounts = await GmailAccount.countDocuments(ownerFilter(req.user.id, { is_active: true }));
     if (activeAccounts === 0) {
-      return res.status(400).json({ error: 'No active Gmail accounts available' });
+      return res.status(400).json({ error: 'Add and activate a Gmail sending account first.', code: 'NO_ACTIVE_GMAIL_ACCOUNT' });
     }
 
     try {

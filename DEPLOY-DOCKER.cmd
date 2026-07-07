@@ -2,7 +2,7 @@
 setlocal EnableExtensions
 title MAILIQ - Deploy with Docker Desktop
 
-set PROJECT_ID=artful-line-417208
+set PROJECT_ID=rosy-etching-417006
 set REGION=asia-south1
 set SERVICE=mailiq-api
 set AR_REPO=mailiq
@@ -37,16 +37,18 @@ if errorlevel 1 (
 )
 
 echo [1/5] Set GCP project...
-gcloud config set project %PROJECT_ID%
+call gcloud config set project %PROJECT_ID%
 if errorlevel 1 goto :fail
 
 echo.
-echo [2/5] Create registry if needed...
-gcloud artifacts repositories create %AR_REPO% --repository-format=docker --location=%REGION% --description="MAILIQ API" 2>nul
+echo [2/5] Enable APIs + create registry if needed...
+call gcloud services enable run.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com
+call gcloud artifacts repositories create %AR_REPO% --repository-format=docker --location=%REGION% --description="MAILIQ API" 2>nul
+if errorlevel 1 echo Registry may already exist - continuing.
 
 echo.
 echo [3/5] Login Docker to Google Artifact Registry...
-gcloud auth configure-docker %REGION%-docker.pkg.dev --quiet
+call gcloud auth configure-docker %REGION%-docker.pkg.dev --quiet
 if errorlevel 1 goto :fail
 
 echo.
@@ -59,7 +61,7 @@ echo [5/5] Push image and deploy to Cloud Run...
 docker push %IMAGE%
 if errorlevel 1 goto :fail
 
-gcloud run deploy %SERVICE% ^
+call gcloud run deploy %SERVICE% ^
   --image %IMAGE% ^
   --region %REGION% ^
   --platform managed ^
@@ -77,7 +79,7 @@ if errorlevel 1 goto :fail
 
 echo.
 echo === DONE ===
-for /f "delims=" %%u in ('gcloud run services describe %SERVICE% --region %REGION% --format^="value(status.url)"') do set API_URL=%%u
+for /f "delims=" %%u in ('call gcloud run services describe %SERVICE% --region %REGION% --format^="value(status.url)"') do set API_URL=%%u
 echo API:    %API_URL%
 echo Health: %API_URL%/api/health
 echo.
@@ -91,5 +93,6 @@ exit /b 0
 :fail
 echo.
 echo DEPLOY FAILED. Check errors above.
+echo If you see billing error, link billing: https://console.cloud.google.com/billing/linkedaccount?project=rosy-etching-417006
 pause
 exit /b 1

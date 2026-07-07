@@ -40,5 +40,9 @@ const sendLogSchema = new mongoose.Schema(
 );
 
 sendLogSchema.index({ campaign_id: 1, created_at: -1 });
+// Backs the recovery/reconcile lookups (findOne by recipient_id + action).
+sendLogSchema.index({ campaign_id: 1, recipient_id: 1, action: 1 });
+// Age out send logs after 90 days so the collection doesn't grow unbounded.
+sendLogSchema.index({ created_at: 1 }, { expireAfterSeconds: 90 * 24 * 60 * 60 });
 
 export default mongoose.model('SendLog', sendLogSchema);

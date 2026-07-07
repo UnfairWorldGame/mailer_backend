@@ -10,6 +10,7 @@ import { resolveUserRole } from '../utils/adminAccess.js';
 import { toApiDoc } from '../utils/apiTransform.js';
 import { computeQuotaSnapshot, listCreditTransactions } from './quotaService.js';
 import { CREDIT_PACKS } from '../config/billingConfig.js';
+import { recordAuditLog } from './auditLogService.js';
 
 function publicUser(user) {
   const api = toApiDoc(user);
@@ -336,7 +337,7 @@ export async function listCampaigns({ page = 1, limit = 20, search = '', status 
   }
 
   if (search?.trim()) {
-    const term = search.trim();
+    const term = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     filter.$or = [
       { name: { $regex: term, $options: 'i' } },
       { subject: { $regex: term, $options: 'i' } },
@@ -423,7 +424,7 @@ export async function listUsers({ page = 1, limit = 20, search = '', role = '', 
   const and = [];
 
   if (search?.trim()) {
-    const term = search.trim();
+    const term = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     and.push({
       $or: [
         { name: { $regex: term, $options: 'i' } },
@@ -584,7 +585,8 @@ export async function getUserDetail(userId) {
   };
 }
 
-export async function updateUser(userId, updates, actingAdminId) {
+export async function updateUser(userId, updates, actingAdmin) {
+  const actingAdminId = typeof actingAdmin === 'object' ? actingAdmin?.id : actingAdmin;
   const user = await User.findById(userId);
   if (!user) return null;
 
@@ -597,6 +599,22 @@ export async function updateUser(userId, updates, actingAdminId) {
     }
   }
 
+  const demotingAdmin = user.role === 'admin' && updates.role === 'user';
+  const disablingAdmin = user.role === 'admin' && user.is_active !== false && updates.is_active === false;
+  if (demotingAdmin || disablingAdmin) {
+    const remainingAdmins = await User.countDocuments({
+      _id: { $ne: user._id },
+      role: 'admin',
+      is_active: { $ne: false },
+    });
+    if (remainingAdmins === 0) {
+      throw new Error('You cannot remove the last remaining admin account');
+    }
+  }
+
+  const prevRole = user.role;
+  const prevActive = user.is_active;
+
   if (updates.role !== undefined) {
     user.role = updates.role === 'admin' ? 'admin' : 'user';
   }
@@ -606,5 +624,33 @@ export async function updateUser(userId, updates, actingAdminId) {
   }
 
   await user.save();
+
+  if (actingAdminId && typeof actingAdmin === 'object') {
+    if (updates.role !== undefined && user.role !== prevRole) {
+      await recordAuditLog({
+        adminId: actingAdminId,
+        adminName: actingAdmin.name || '',
+        adminEmail: actingAdmin.email || '',
+        action: 'user_role_change',
+        targetUserId: user._id,
+        targetUserName: user.name,
+        targetUserEmail: user.email,
+        metadata: { from: prevRole, to: user.role },
+      });
+    }
+    if (updates.is_active !== undefined && user.is_active !== prevActive) {
+      await recordAuditLog({
+        adminId: actingAdminId,
+        adminName: actingAdmin.name || '',
+        adminEmail: actingAdmin.email || '',
+        action: 'user_status_change',
+        targetUserId: user._id,
+        targetUserName: user.name,
+        targetUserEmail: user.email,
+        metadata: { from: prevActive, to: user.is_active },
+      });
+    }
+  }
+
   return publicUser(user);
 }

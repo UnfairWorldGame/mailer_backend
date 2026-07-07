@@ -15,7 +15,7 @@ export function createTransporter(email, appPassword) {
 export async function sendCampaignEmail(account, recipient, subject, body, attachments = []) {
   const transporter = createTransporter(account.email, account.app_password);
   const personalizedSubject = personalize(subject, recipient);
-  const personalizedBody = personalize(body, recipient);
+  const personalizedBody = personalize(body, recipient, { escapeHtml: true });
 
   const mailAttachments = attachments.map((a) => ({
     filename: a.original_name,

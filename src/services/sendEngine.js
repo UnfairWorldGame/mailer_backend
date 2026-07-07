@@ -105,6 +105,7 @@ async function processCampaign(campaignId) {
     if (!accounts.length) {
       campaign.status = 'failed';
       await campaign.save();
+      await releaseCampaignQuota(campaign.user_id, campaignId);
       await writeLog({
         campaignId,
         level: 'error',
@@ -114,12 +115,12 @@ async function processCampaign(campaignId) {
       return;
     }
 
-    const useRotation = accounts.length > 1;
+    const useRotation = campaign.rotate_accounts !== false && accounts.length > 1;
     const perAccountDelayMs = resolvePerAccountDelayMs(campaign.send_delay_ms);
 
     const rotator = new AccountRotator(accounts, {
       preferredAccountId: useRotation ? null : campaign.gmail_account_id,
-      rotate: useRotation || campaign.rotate_accounts !== false,
+      rotate: useRotation,
       perAccountDelayMs,
     });
     const attachments = campaign.attachments || [];
@@ -272,8 +273,6 @@ async function processCampaign(campaignId) {
         await recordAccountSend(account);
         rotator.markSent(account);
 
-        await consumeSendQuota(campaign.user_id, campaignId);
-
         const updated = await finalizeRecipient(recipient._id, claimToken, {
           status: 'sent',
           sent_at: new Date(),
@@ -285,7 +284,11 @@ async function processCampaign(campaignId) {
           claimed_by: null,
         });
 
-        if (!updated) {
+        if (updated) {
+          // Charge exactly once — only the worker that wins the finalize consumes
+          // the credit. A lost claim means another worker already accounted for it.
+          await consumeSendQuota(campaign.user_id, campaignId);
+        } else {
           await writeLog({
             campaignId,
             recipientId: recipient._id,

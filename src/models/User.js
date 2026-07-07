@@ -20,6 +20,10 @@ const userSchema = new mongoose.Schema(
     free_quota_date: { type: String, default: null },
     reserved_credits: { type: Number, default: 0, min: 0 },
     has_paid_access: { type: Boolean, default: false },
+    // Lifetime running totals — never reset, used for the profile analytics
+    // section. Updated atomically alongside the credit they track.
+    lifetime_credits_used: { type: Number, default: 0, min: 0 },
+    lifetime_credits_received: { type: Number, default: 0, min: 0 },
   },
   { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } }
 );

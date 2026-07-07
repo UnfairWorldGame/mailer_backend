@@ -12,10 +12,12 @@ import {
 } from '../services/adminService.js';
 import {
   grantCredits,
+  grantFreeCredits,
   revokeCredits,
   resolvePackCredits,
   listCreditTransactions,
 } from '../services/quotaService.js';
+import { listAuditLogs } from '../services/auditLogService.js';
 const router = Router();
 
 router.use(requireAuth, requireAdmin);
@@ -122,7 +124,7 @@ router.patch('/users/:id', async (req, res, next) => {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
 
-    const user = await updateUser(req.params.id, updates, req.user.id);
+    const user = await updateUser(req.params.id, updates, req.user);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -159,6 +161,8 @@ router.post('/users/:id/grant-credits', async (req, res, next) => {
       payment_ref: paymentRef?.trim() || null,
       pack_label: packLabel,
       note: note?.trim() || null,
+      adminName: req.user.name,
+      adminEmail: req.user.email,
     });
 
     if (!result) {
@@ -179,6 +183,55 @@ router.post('/users/:id/grant-credits', async (req, res, next) => {
   }
 });
 
+router.post('/users/:id/grant-free-credits', async (req, res, next) => {
+  try {
+    const { amount, reason } = req.body || {};
+    const credits = parseInt(amount, 10);
+
+    if (!Number.isFinite(credits) || credits <= 0) {
+      return res.status(400).json({ error: 'Provide a positive credit amount to grant' });
+    }
+    if (credits > 100000) {
+      return res.status(400).json({ error: 'Free credit grants are capped at 100,000 per request' });
+    }
+
+    const result = await grantFreeCredits(req.params.id, credits, req.user.id, {
+      reason: reason?.trim() || null,
+      adminName: req.user.name,
+      adminEmail: req.user.email,
+    });
+
+    if (!result) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      message: result.confirmation_email_sent
+        ? `Granted ${credits} free credits — confirmation email sent to the user`
+        : `Granted ${credits} free credits`,
+      ...result,
+    });
+  } catch (err) {
+    if (err.message?.includes('must be')) {
+      return res.status(400).json({ error: err.message });
+    }
+    next(err);
+  }
+});
+
+router.get('/audit-log', async (req, res, next) => {
+  try {
+    const result = await listAuditLogs({
+      page: req.query.page,
+      limit: req.query.limit,
+      action: req.query.action,
+    });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post('/users/:id/revoke-credits', async (req, res, next) => {
   try {
     const { amount, note } = req.body || {};
@@ -190,6 +243,8 @@ router.post('/users/:id/revoke-credits', async (req, res, next) => {
 
     const result = await revokeCredits(req.params.id, credits, req.user.id, {
       note: note?.trim() || null,
+      adminName: req.user.name,
+      adminEmail: req.user.email,
     });
 
     if (!result) {

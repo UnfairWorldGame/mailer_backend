@@ -11,6 +11,7 @@ import mongoose from 'mongoose';
 import { connectDB } from './db/connect.js';
 import { resumeInterruptedCampaigns } from './services/sendEngine.js';
 import { applySecurity } from './middleware/security.js';
+import { assertJwtSecret } from './middleware/auth.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
 import { getAllowedOrigins, normalizeOrigin } from './config/origins.js';
 import accountsRouter from './routes/accounts.js';
@@ -22,6 +23,10 @@ import authRouter from './routes/auth.js';
 import adminRouter from './routes/admin.js';
 import inquiriesRouter from './routes/inquiries.js';
 import billingRouter from './routes/billing.js';
+import certificatesRouter from './routes/certificates.js';
+import notificationsRouter from './routes/notifications.js';
+import { resumeInterruptedCertificateJobs } from './services/certificateSendEngine.js';
+import { startCertificateSweeper } from './services/certificateSweeper.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -66,19 +71,25 @@ app.use('/api/uploads', uploadsRouter);
 app.use('/api/campaigns', campaignsRouter);
 app.use('/api/analytics', analyticsRouter);
 app.use('/api/ai', aiRouter);
+app.use('/api/certificates', certificatesRouter);
+app.use('/api/notifications', notificationsRouter);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
 
 async function start() {
+  assertJwtSecret();
   await connectDB();
 
   mongoose.connection.on('reconnected', () => {
     console.log('MongoDB reconnected — checking for interrupted campaigns');
     resumeInterruptedCampaigns().catch(console.error);
+    resumeInterruptedCertificateJobs().catch(console.error);
   });
 
   await resumeInterruptedCampaigns();
+  await resumeInterruptedCertificateJobs().catch(console.error);
+  startCertificateSweeper();
 
   const server = app.listen(PORT, HOST, () => {
     console.log(`MAILIQ API running on http://${HOST}:${PORT}`);

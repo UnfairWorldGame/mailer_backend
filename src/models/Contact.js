@@ -10,5 +10,7 @@ const contactSchema = new mongoose.Schema(
 );
 
 contactSchema.index({ user_id: 1, email: 1 }, { unique: true });
+// Backs the paginated contact list (filter by user_id, sort by created_at desc).
+contactSchema.index({ user_id: 1, created_at: -1 });
 
 export default mongoose.model('Contact', contactSchema);

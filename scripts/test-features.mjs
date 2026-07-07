@@ -13,6 +13,8 @@ let baseUrl;
 let server;
 let campaignId;
 let accountId;
+let authToken;
+let testUserId;
 
 const results = [];
 
@@ -28,11 +30,35 @@ function fail(name, err) {
 
 async function request(path, options = {}) {
   const res = await fetch(`${baseUrl}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      ...options.headers,
+    },
     ...options,
   });
   const data = await res.json().catch(() => ({}));
   return { res, data };
+}
+
+async function authenticate() {
+  // All routes now require a logged-in user (routes filter by req.user.id).
+  // Create a throwaway user directly and sign a token the same way login does,
+  // rather than going through the HTTP register/verify flow.
+  const { default: User } = await import('../src/models/User.js');
+  const { signToken } = await import('../src/middleware/auth.js');
+
+  // Against a real (non-memory-server) MONGODB_URI, a leftover user from a
+  // previous run would collide on the unique email index — clear it first so
+  // the suite is safely re-runnable.
+  await User.deleteOne({ email: 'test-runner@mailer.test' });
+  const user = await User.create({
+    name: 'Test Runner',
+    email: 'test-runner@mailer.test',
+    password: 'Test-Password-123!',
+  });
+  testUserId = user._id;
+  authToken = signToken(user._id);
 }
 
 async function setupDb() {
@@ -69,6 +95,12 @@ async function startServer() {
 }
 
 async function seedData() {
+  // Clear any leftover account from a previous run under the old (deleted)
+  // test user — a stale/legacy index on this collection could otherwise
+  // collide on email alone even though the owning user differs.
+  const GmailAccount = (await import('../src/models/GmailAccount.js')).default;
+  await GmailAccount.deleteMany({ email: 'test@gmail.com' });
+
   const { res: accRes, data: account } = await request('/accounts', {
     method: 'POST',
     body: JSON.stringify({
@@ -84,9 +116,9 @@ async function seedData() {
   const Contact = (await import('../src/models/Contact.js')).default;
   await Contact.deleteMany({});
   await Contact.insertMany([
-    { name: 'Alice', email: 'alice@example.com' },
-    { name: 'Bob', email: 'bob@example.com' },
-    { name: 'Carol', email: 'carol@example.com' },
+    { user_id: testUserId, name: 'Alice', email: 'alice@example.com' },
+    { user_id: testUserId, name: 'Bob', email: 'bob@example.com' },
+    { user_id: testUserId, name: 'Carol', email: 'carol@example.com' },
   ]);
 
   const { res, data } = await request('/campaigns', {
@@ -229,6 +261,141 @@ async function testRetryFailed() {
   }
 }
 
+async function testRetryFailedRespectsMaxRetries() {
+  // Regression test: POST /:id/retry-failed (without reset_attempts) must not
+  // requeue recipients that already exhausted max_retries_per_recipient —
+  // it previously ignored the cap entirely (see campaigns.js retry-failed route).
+  try {
+    const CampaignRecipient = (await import('../src/models/CampaignRecipient.js')).default;
+    const Campaign = (await import('../src/models/Campaign.js')).default;
+    const { sendConfig } = await import('../src/config/sendConfig.js');
+    const { isCampaignRunning } = await import('../src/services/sendEngine.js');
+
+    // testRetryFailed (above) started a real background send loop against the
+    // fake test Gmail account. Wait for it to fully drain before staging our
+    // own recipient states, or it'll race-claim whatever we set to pending.
+    for (let i = 0; i < 50 && isCampaignRunning(campaignId); i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    const recipients = await CampaignRecipient.find({ campaign_id: campaignId }).limit(2);
+    if (recipients.length < 2) throw new Error('expected at least 2 seeded recipients');
+    const [exhausted, retryable] = recipients;
+
+    await CampaignRecipient.updateMany({ campaign_id: campaignId }, { $set: { status: 'sent' } });
+    await CampaignRecipient.findByIdAndUpdate(exhausted._id, {
+      $set: { status: 'failed', error_message: 'permanent', attempt_count: sendConfig.maxRetriesPerRecipient },
+    });
+    await CampaignRecipient.findByIdAndUpdate(retryable._id, {
+      $set: { status: 'failed', error_message: 'transient', attempt_count: sendConfig.maxRetriesPerRecipient - 1 },
+    });
+    // Pretend a send loop is already active (status 'sending') so the route's
+    // `if (campaign.status !== 'sending') startCampaignSend(...)` branch is
+    // skipped — otherwise this kicks off a real async send against the fake
+    // test Gmail account and the resulting race makes this assertion flaky.
+    await Campaign.findByIdAndUpdate(campaignId, { status: 'sending', failed_count: 2 });
+
+    const { res, data } = await request(`/campaigns/${campaignId}/retry-failed`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    if (!res.ok) throw new Error(data.error);
+
+    const exhaustedAfter = await CampaignRecipient.findById(exhausted._id);
+    if (exhaustedAfter.status !== 'failed') {
+      throw new Error(`recipient at max retries was requeued (status=${exhaustedAfter.status})`);
+    }
+    const retryableAfter = await CampaignRecipient.findById(retryable._id);
+    if (retryableAfter.status !== 'pending') {
+      throw new Error(`recipient under retry cap was not requeued (status=${retryableAfter.status})`);
+    }
+    pass('POST /campaigns/:id/retry-failed respects max_retries_per_recipient');
+  } catch (err) {
+    fail('POST /campaigns/:id/retry-failed respects max_retries_per_recipient', err);
+  }
+}
+
+async function testCampaignDeleteReleasesReservedCredits() {
+  // Regression test: deleting a campaign must release its reserved credits back
+  // to the user — it previously deleted the campaign without releasing
+  // quota_reserved, permanently stranding those credits (see campaigns.js DELETE).
+  try {
+    const User = (await import('../src/models/User.js')).default;
+    const Campaign = (await import('../src/models/Campaign.js')).default;
+    const { reserveCampaignQuota } = await import('../src/services/quotaService.js');
+
+    await reserveCampaignQuota(testUserId, campaignId, 3);
+    const reservedUser = await User.findById(testUserId).select('reserved_credits');
+    if (reservedUser.reserved_credits < 3) {
+      throw new Error(`expected reserved_credits >= 3, got ${reservedUser.reserved_credits}`);
+    }
+
+    const { res, data } = await request(`/campaigns/${campaignId}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error(data.error);
+
+    const afterUser = await User.findById(testUserId).select('reserved_credits');
+    if (afterUser.reserved_credits !== 0) {
+      throw new Error(`expected reserved_credits to be released to 0, got ${afterUser.reserved_credits}`);
+    }
+    const deletedCampaign = await Campaign.findById(campaignId);
+    if (deletedCampaign) throw new Error('campaign was not deleted');
+
+    pass('DELETE /campaigns/:id releases reserved credits');
+  } catch (err) {
+    fail('DELETE /campaigns/:id releases reserved credits', err);
+  }
+}
+
+async function testPersonalizeEscapesHtml() {
+  // Regression test: merge-field substitution must HTML-escape untrusted
+  // recipient data before it's injected into the email body — it previously
+  // did a raw string replace, letting a contact's name inject markup/scripts
+  // into every recipient's inbox (see utils/personalize.js).
+  try {
+    const { personalize } = await import('../src/utils/personalize.js');
+    const recipient = { name: '<img src=x onerror=alert(1)>', email: 'a@b.com' };
+
+    const body = personalize('Hi {{name}}', recipient, { escapeHtml: true });
+    if (body.includes('<img')) throw new Error(`expected escaped output, got: ${body}`);
+    if (!body.includes('&lt;img')) throw new Error(`expected HTML-entity escaping, got: ${body}`);
+
+    const subject = personalize('Hi {{name}}', recipient);
+    if (!subject.includes('<img')) throw new Error('subject (non-HTML context) should not be escaped');
+
+    pass('personalize() escapes untrusted recipient data in HTML context');
+  } catch (err) {
+    fail('personalize() escapes untrusted recipient data in HTML context', err);
+  }
+}
+
+async function testPdfMagicByteValidation() {
+  // Regression test: attachment upload must verify actual file content, not
+  // just client-supplied mimetype/extension (see middleware/pdfUpload.js).
+  try {
+    const fs = (await import('fs')).default;
+    const os = (await import('os')).default;
+    const path = (await import('path')).default;
+    const { hasPdfMagicBytes } = await import('../src/utils/fileSignature.js');
+
+    const fakePdfPath = path.join(os.tmpdir(), `fake-${Date.now()}.pdf`);
+    fs.writeFileSync(fakePdfPath, '<html><script>alert(1)</script></html>');
+    const realPdfPath = path.join(os.tmpdir(), `real-${Date.now()}.pdf`);
+    fs.writeFileSync(realPdfPath, '%PDF-1.4\n%fake but has the right header');
+
+    const fakeIsValid = await hasPdfMagicBytes(fakePdfPath);
+    const realIsValid = await hasPdfMagicBytes(realPdfPath);
+    fs.unlinkSync(fakePdfPath);
+    fs.unlinkSync(realPdfPath);
+
+    if (fakeIsValid) throw new Error('HTML file disguised with .pdf extension was accepted as a valid PDF');
+    if (!realIsValid) throw new Error('file with a real %PDF- header was rejected');
+
+    pass('hasPdfMagicBytes verifies actual file content, not just extension');
+  } catch (err) {
+    fail('hasPdfMagicBytes verifies actual file content, not just extension', err);
+  }
+}
+
 async function testLogsWithFilters() {
   try {
     const { writeLog } = await import('../src/services/logService.js');
@@ -297,6 +464,19 @@ async function cleanup() {
     await new Promise((r) => setTimeout(r, 100));
   }
 
+  // Leave no trace on a real (non-memory-server) database.
+  if (testUserId && mongoose.connection.readyState === 1) {
+    const { default: User } = await import('../src/models/User.js');
+    const { default: Contact } = await import('../src/models/Contact.js');
+    const { default: GmailAccount } = await import('../src/models/GmailAccount.js');
+    const { default: CampaignRecipient } = await import('../src/models/CampaignRecipient.js');
+    if (campaignId) await CampaignRecipient.deleteMany({ campaign_id: campaignId });
+    await Campaign.deleteMany({ user_id: testUserId });
+    await Contact.deleteMany({ user_id: testUserId });
+    await GmailAccount.deleteMany({ user_id: testUserId });
+    await User.deleteOne({ _id: testUserId });
+  }
+
   if (server) {
     await new Promise((resolve) => server.close(resolve));
   }
@@ -312,6 +492,7 @@ async function main() {
   try {
     await setupDb();
     await startServer();
+    await authenticate();
     await seedData();
 
     await testHealthAndConfig();
@@ -319,8 +500,12 @@ async function main() {
     await testProgressEndpoint();
     await testAtomicClaimAndRecovery();
     await testRetryFailed();
+    await testRetryFailedRespectsMaxRetries();
     await testLogsWithFilters();
     await testResumeInterrupted();
+    await testCampaignDeleteReleasesReservedCredits();
+    await testPersonalizeEscapesHtml();
+    await testPdfMagicByteValidation();
     await testErrorClassifier();
   } catch (err) {
     console.error('\nSetup failed:', err.message);
@@ -334,6 +519,9 @@ async function main() {
   if (failed.length > 0) {
     console.log('\nFailed:');
     failed.forEach((f) => console.log(`  - ${f.name}: ${f.error}`));
+    process.exitCode = 1;
+  } else if (results.length === 0) {
+    console.log('\nNo tests ran (setup failed before any test executed).\n');
     process.exitCode = 1;
   } else {
     console.log('\nAll tests passed.\n');

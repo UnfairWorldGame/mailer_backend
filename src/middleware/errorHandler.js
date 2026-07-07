@@ -22,9 +22,10 @@ export function errorHandler(err, _req, res, _next) {
   }
 
   const status = err.status || err.statusCode || 500;
-  const message = status === 500 && process.env.NODE_ENV === 'production'
-    ? 'Internal server error'
-    : err.message || 'Internal server error';
+  // Never leak internal error details (stack-adjacent messages, DB/SMTP errors)
+  // to clients for unexpected 5xx failures — regardless of NODE_ENV. Details are
+  // already logged above. Only intentional 4xx errors carry a client-safe message.
+  const message = status >= 500 ? 'Internal server error' : err.message || 'Request failed';
 
   res.status(status).json({ error: message });
 }

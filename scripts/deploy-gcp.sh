@@ -2,7 +2,7 @@
 # Build and deploy MAILIQ API to Google Cloud Run
 set -euo pipefail
 
-PROJECT_ID="artful-line-417208"
+PROJECT_ID="rosy-etching-417006"
 REGION="asia-south1"
 SERVICE="mailiq-api"
 

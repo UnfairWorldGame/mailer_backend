@@ -63,18 +63,39 @@ export async function markAccountLimitReached(account, reason) {
 
 export async function recordAccountSend(account) {
   await resetAccountCountersIfNeeded(account);
-  account.sends_today += 1;
-  account.sends_this_hour += 1;
-  account.total_sent += 1;
-  account.last_sent_at = new Date();
+
+  // Atomic increment so two concurrent campaigns/instances using the same account
+  // cannot both write back a stale counter and undercount sends (which would blow
+  // past Gmail's real daily/hourly caps and risk suspension).
+  const now = new Date();
+  const fresh = await account.constructor.findOneAndUpdate(
+    { _id: account._id },
+    {
+      $inc: { sends_today: 1, sends_this_hour: 1, total_sent: 1 },
+      $set: { last_sent_at: now },
+    },
+    { new: true }
+  );
+
+  if (!fresh) return account;
+
+  // Reflect the authoritative DB counts back onto the in-memory doc the rotator
+  // keeps using for availability checks.
+  account.sends_today = fresh.sends_today;
+  account.sends_this_hour = fresh.sends_this_hour;
+  account.total_sent = fresh.total_sent;
+  account.last_sent_at = fresh.last_sent_at;
 
   const limits = getAccountLimits(account);
-  if (account.sends_today >= limits.daily || account.sends_this_hour >= limits.hourly) {
+  if (fresh.sends_today >= limits.daily || fresh.sends_this_hour >= limits.hourly) {
+    await account.constructor.updateOne(
+      { _id: account._id },
+      { $set: { limit_reached: true, limit_reached_at: now } }
+    );
     account.limit_reached = true;
-    account.limit_reached_at = new Date();
+    account.limit_reached_at = now;
   }
 
-  await account.save();
   return account;
 }
 

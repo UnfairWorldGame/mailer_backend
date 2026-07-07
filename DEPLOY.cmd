@@ -2,7 +2,7 @@
 setlocal EnableExtensions
 title MAILIQ Backend Deploy to Google Cloud Run
 
-set PROJECT_ID=artful-line-417208
+set PROJECT_ID=rosy-etching-417006
 set REGION=asia-south1
 set SERVICE=mailiq-api
 set AR_REPO=mailiq
