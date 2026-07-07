@@ -14,7 +14,7 @@ import CertificateJob from '../models/CertificateJob.js';
 import CertificateRecipient from '../models/CertificateRecipient.js';
 import CertSendEvent from '../models/CertSendEvent.js';
 import GmailAccount from '../models/GmailAccount.js';
-import { createJobDir, extractPdfsFromZip, removeJobDir } from '../services/certificateFiles.js';
+import { createJobDir, extractPdfsFromZip, removeJobDir, pdfPath } from '../services/certificateFiles.js';
 import { splitCertificatePdf } from '../services/certificatePdfSplitter.js';
 import { readSheetRows, matchCertificates, matchCertificatesFromPdfPages } from '../utils/certMatch.js';
 import {
@@ -53,6 +53,48 @@ const MAX_BODY = 50000;
 
 function jobView(job) {
   return toApiDoc(job, { is_sendable: job.total_recipients > 0 });
+}
+
+// Turns a zero-extracted-files outcome into a specific, actionable message
+// instead of a generic "no PDFs found" — the exact reason (oversized files,
+// wrong file type, unsupported ZIP compression, etc.) is what the user
+// actually needs to fix their upload.
+function describeEmptyZipResult(stats) {
+  if (!stats.total_entries) {
+    return 'The ZIP file is empty — it has no files inside it.';
+  }
+
+  const reasons = [];
+  if (stats.rejected_unsupported_compression > 0) {
+    reasons.push(
+      `${stats.rejected_unsupported_compression} file(s) used a ZIP compression method that isn't supported — ` +
+      're-create the ZIP with Windows\' built-in "Compress to ZIP" or macOS Finder\'s "Compress", not 7-Zip\'s advanced/Ultra settings'
+    );
+  }
+  if (stats.rejected_oversized > 0) {
+    const limitMb = Math.round(certConfig.maxPdfBytes / (1024 * 1024));
+    reasons.push(`${stats.rejected_oversized} file(s) exceeded the ${limitMb}MB per-certificate size limit`);
+  }
+  if (stats.rejected_unsupported_type > 0) {
+    reasons.push(`${stats.rejected_unsupported_type} file(s) were not a valid PDF, PNG, or JPEG`);
+  }
+  if (stats.rejected_stream_error > 0) {
+    reasons.push(`${stats.rejected_stream_error} file(s) could not be read from the ZIP (it may be partially corrupted)`);
+  }
+  if (stats.skipped_junk > 0 && stats.skipped_junk === stats.total_entries) {
+    reasons.push('every entry was a folder or hidden/system file, not a certificate');
+  }
+
+  const entryWord = stats.total_entries === 1 ? 'entry' : 'entries';
+  const sample = stats.sample_entry_names?.length
+    ? ` Files found: ${stats.sample_entry_names.map((n) => `"${n}"`).join(', ')}${stats.sample_entry_names.length < stats.total_entries - stats.skipped_junk ? ', ...' : ''}.`
+    : '';
+
+  if (!reasons.length) {
+    return `No valid PDF, PNG, or JPEG certificates were found inside the ZIP (scanned ${stats.total_entries} ${entryWord}).${sample}`;
+  }
+
+  return `No certificates could be extracted from the ZIP (scanned ${stats.total_entries} ${entryWord}): ${reasons.join('; ')}.${sample}`;
 }
 
 function cleanSubject(value) {
@@ -140,7 +182,7 @@ router.post('/upload', uploadLimiter, (req, res, next) => {
 
         if (!files.length) {
           await removeJobDir(jobDir.dirName);
-          return res.status(400).json({ error: 'No valid PDF certificates were found inside the ZIP.' });
+          return res.status(400).json({ error: describeEmptyZipResult(extractStats) });
         }
       }
 
@@ -285,6 +327,47 @@ router.get('/:id/recipients', async (req, res, next) => {
     ]);
 
     res.json({ data: toApiDocs(rows), total, page, limit });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /:id/recipients/:recipientId/preview — stream the matched certificate
+// file (PDF, PNG, or JPEG) so the review screen can show/open it before send.
+// Accepts a ?token= query param (see requireAuth) since this is opened as a
+// direct link/new tab rather than fetched with an Authorization header.
+router.get('/:id/recipients/:recipientId/preview', async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.recipientId)) {
+      return res.status(404).json({ error: 'Certificate not found' });
+    }
+    const job = await loadOwnedJob(req, res);
+    if (!job) return;
+
+    if (job.files_deleted) {
+      return res.status(404).json({ error: 'Certificate files for this job have been cleaned up.' });
+    }
+
+    const recipient = await CertificateRecipient.findOne({ _id: req.params.recipientId, job_id: job._id });
+    if (!recipient || !recipient.matched_file) {
+      return res.status(404).json({ error: 'Certificate not found' });
+    }
+
+    const filePath = pdfPath(job.job_dir, recipient.matched_file);
+    try {
+      await fs.access(filePath);
+    } catch {
+      return res.status(404).json({ error: 'Certificate file not found on server' });
+    }
+
+    const rawName = recipient.original_pdf_name || recipient.matched_file;
+    const asciiName = rawName.replace(/["\r\n]/g, '');
+    res.setHeader('Content-Type', recipient.mime_type || 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(rawName)}`
+    );
+    res.sendFile(path.resolve(filePath));
   } catch (err) {
     next(err);
   }

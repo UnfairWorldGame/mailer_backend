@@ -11,7 +11,10 @@ export const certConfig = {
   // streamed ZIP path.
   maxSinglePdfBytes: intEnv('CERT_MAX_SINGLE_PDF_BYTES', 200 * 1024 * 1024), // 200MB
   maxSheetBytes: intEnv('CERT_MAX_SHEET_BYTES', 10 * 1024 * 1024),     // 10MB sheet
-  maxPdfBytes: intEnv('CERT_MAX_PDF_BYTES', 25 * 1024 * 1024),         // 25MB per certificate (per split page too)
+  // Real-world certificate PDFs (Canva/Adobe exports with embedded fonts and
+  // print-quality images) commonly land in the 10-40MB range — 25MB was too
+  // tight and silently rejected legitimate certificates.
+  maxPdfBytes: intEnv('CERT_MAX_PDF_BYTES', 50 * 1024 * 1024),         // 50MB per certificate (per split page too)
   maxTotalExtractedBytes: intEnv('CERT_MAX_TOTAL_BYTES', 3 * 1024 * 1024 * 1024), // 3GB uncompressed
   maxPdfCount: intEnv('CERT_MAX_PDF_COUNT', 20000),                    // entries per zip, or pages per multi-page PDF
   maxRows: intEnv('CERT_MAX_ROWS', 20000),                             // rows per sheet

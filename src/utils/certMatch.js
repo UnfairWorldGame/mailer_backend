@@ -17,8 +17,13 @@ export function normalizeKey(value) {
     .replace(/[^a-z0-9]/g, '');
 }
 
-function stripPdfExtension(filename) {
-  return String(filename ?? '').replace(/\.pdf$/i, '');
+// Certificate extraction now matches PDFs by content, not filename/extension
+// (see certificateFiles.js), so a real certificate can arrive with a missing,
+// wrong, or unusual extension (e.g. no extension, ".docx", ".PDF"). Matching
+// must be equally extension-agnostic — strip whatever trailing extension is
+// present (if any), not just ".pdf", so "John Doe.docx" still matches "John Doe".
+function stripFileExtension(filename) {
+  return String(filename ?? '').replace(/\.[^.\s]+$/, '');
 }
 
 function emailLocalPart(email) {
@@ -61,7 +66,7 @@ function classifyEmailRow(row, seenEmails) {
       recipient: {
         name, email: row.email || '', normalized_name: normalizeKey(name),
         match_status: 'invalid_email', match_note: 'Email address is missing or invalid.',
-        send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0,
+        send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0, mime_type: null, mime_type: null,
       },
     };
   }
@@ -72,7 +77,7 @@ function classifyEmailRow(row, seenEmails) {
       recipient: {
         name, email, normalized_name: normalizeKey(name),
         match_status: 'duplicate', match_note: 'Duplicate email — already listed above.',
-        send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0,
+        send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0, mime_type: null,
       },
     };
   }
@@ -133,7 +138,7 @@ export function matchCertificates(rows, files) {
   // normalize to the same key are kept in order; each is consumed at most once.
   const fileBuckets = new Map();
   for (const f of files) {
-    const key = normalizeKey(stripPdfExtension(f.original_name));
+    const key = normalizeKey(stripFileExtension(f.original_name));
     if (!key) continue;
     if (!fileBuckets.has(key)) fileBuckets.set(key, []);
     fileBuckets.get(key).push(f);
@@ -194,7 +199,7 @@ export function matchCertificates(rows, files) {
           name, email, normalized_name: nameKey,
           match_status: 'ambiguous_name',
           match_note: `${rowNameCounts.get(nameKey)} recipients share the name "${name}" — couldn't safely tell them apart by name alone. Rename certificate files to match each person's email, or send manually.`,
-          send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0,
+          send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0, mime_type: null,
         });
       } else {
         stats.missing_certificate++;
@@ -202,7 +207,7 @@ export function matchCertificates(rows, files) {
           name, email, normalized_name: nameKey,
           match_status: 'missing_certificate',
           match_note: 'No certificate PDF matched this name.',
-          send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0,
+          send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0, mime_type: null,
         });
       }
       continue;
@@ -217,6 +222,7 @@ export function matchCertificates(rows, files) {
       matched_file: file.stored_name,
       original_pdf_name: file.original_name,
       file_size: file.size,
+      mime_type: file.mime_type || 'application/pdf',
     });
   }
 
@@ -277,7 +283,7 @@ export function matchCertificatesFromPdfPages(rows, pages) {
         name, email, normalized_name: normalizeKey(name),
         match_status: 'missing_certificate',
         match_note: 'No name was provided, so no certificate page could be matched.',
-        send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0,
+        send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0, mime_type: null,
       };
       return;
     }
@@ -371,6 +377,7 @@ export function matchCertificatesFromPdfPages(rows, pages) {
           matched_file: page.stored_name,
           original_pdf_name: `${c.name} (Page ${page.page_number}).pdf`,
           file_size: page.size,
+          mime_type: 'application/pdf',
         };
       });
       continue;
@@ -389,7 +396,7 @@ export function matchCertificatesFromPdfPages(rows, pages) {
           name: c.name, email: c.email, normalized_name: normalizeKey(c.name),
           match_status: 'missing_certificate',
           match_note: 'No page in the uploaded PDF matched this name.',
-          send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0,
+          send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0, mime_type: null,
         };
         continue;
       }
@@ -404,7 +411,7 @@ export function matchCertificatesFromPdfPages(rows, pages) {
         match_note: crossNameCollision
           ? 'The matching page also mentions another recipient\'s name — couldn\'t safely tell them apart.'
           : `${rowIndexesInGroup.length} recipients share this name but ${exclusivePages.length} certificate page(s) matched it — the counts don't line up, so they couldn't be safely paired. Check for a missing or extra certificate page.`,
-        send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0,
+        send_status: 'skipped', matched_file: null, original_pdf_name: null, file_size: 0, mime_type: null,
       };
     }
   }

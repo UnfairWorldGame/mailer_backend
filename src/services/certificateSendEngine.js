@@ -27,6 +27,19 @@ const workerId = getWorkerId();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const EXT_BY_MIME = { 'application/pdf': '.pdf', 'image/png': '.png', 'image/jpeg': '.jpg' };
+
+// The email attachment's displayed filename should always carry an extension
+// matching its real content type — some export tools produce zip entries
+// with no extension at all (e.g. "1", "2"), and without this an image
+// certificate would otherwise arrive in the recipient's inbox as a
+// nameless/extensionless file.
+function attachmentFileName(originalName, mimeType) {
+  const name = originalName || 'certificate';
+  const ext = EXT_BY_MIME[mimeType] || '.pdf';
+  return new RegExp(`\\${ext}$`, 'i').test(name) ? name : `${name}${ext}`;
+}
+
 export function isJobRunning(jobId) {
   return activeJobs.has(jobId.toString());
 }
@@ -233,10 +246,15 @@ async function sendWorker(jobId, job, rotator, perAccountDelayMs) {
     }
     consecutiveNoAccount = 0;
 
+    // Certificates may be PDF, PNG, or JPEG (detected by content at upload
+    // time, see certificateFiles.js) — attach with the recipient's real type
+    // rather than assuming PDF. Older jobs created before mime_type existed
+    // fall back to PDF, matching their actual stored file.
+    const mimeType = recipient.mime_type || 'application/pdf';
     const attachments = [{
-      original_name: recipient.original_pdf_name || 'certificate.pdf',
+      original_name: attachmentFileName(recipient.original_pdf_name, mimeType),
       file_path: pdfPath(job.job_dir, recipient.matched_file),
-      mime_type: 'application/pdf',
+      mime_type: mimeType,
     }];
 
     await writeEvent(jobId, {

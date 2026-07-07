@@ -12,10 +12,12 @@ const certificateRecipientSchema = new mongoose.Schema(
     email: { type: String, default: '', trim: true, lowercase: true },
     normalized_name: { type: String, default: '' },
 
-    // Matched certificate on disk (basename within the job folder).
+    // Matched certificate on disk (basename within the job folder). Certificates
+    // may be PDF, PNG, or JPEG — detected by content, not by file name.
     matched_file: { type: String, default: null },
     original_pdf_name: { type: String, default: null },
     file_size: { type: Number, default: 0 },
+    mime_type: { type: String, default: null },
 
     // Why this row is / isn't sendable.
     //  matched             — has a PDF + valid email + unique  => sendable
