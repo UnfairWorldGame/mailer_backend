@@ -42,4 +42,12 @@ const campaignSchema = new mongoose.Schema(
   { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } }
 );
 
+// The quota reconciler sweeps live reservations every 30 minutes and the admin
+// analytics aggregate on them; without this both are collection scans. Partial
+// so it only covers the handful of campaigns actually holding credits.
+campaignSchema.index(
+  { quota_reserved: 1, status: 1 },
+  { partialFilterExpression: { quota_reserved: { $gt: 0 } } }
+);
+
 export default mongoose.model('Campaign', campaignSchema);

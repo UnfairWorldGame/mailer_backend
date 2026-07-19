@@ -14,6 +14,8 @@ const adminAuditLogSchema = new mongoose.Schema(
         'grant_credits',
         'grant_free_credits',
         'revoke_credits',
+        'refund_credits',
+        'reconcile_credits',
         'user_role_change',
         'user_status_change',
       ],

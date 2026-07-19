@@ -2,7 +2,9 @@ import mongoose from 'mongoose';
 
 const creditPurchaseRequestSchema = new mongoose.Schema(
   {
-    email: { type: String, required: true, lowercase: true, trim: true, index: true },
+    // Indexes are declared explicitly below; `index: true` here as well produced
+    // a duplicate-index warning at boot.
+    email: { type: String, required: true, lowercase: true, trim: true },
     name: { type: String, required: true, trim: true },
     phone: { type: String, required: true, trim: true },
     pack_label: { type: String, required: true, trim: true },
@@ -20,5 +22,13 @@ const creditPurchaseRequestSchema = new mongoose.Schema(
 );
 
 creditPurchaseRequestSchema.index({ email: 1, status: 1 });
+
+// "One pending request per email" was enforced only by a read-then-create in
+// creditPurchaseService, which two concurrent submissions both pass. Let the
+// database be the authority; the service now handles the duplicate-key error.
+creditPurchaseRequestSchema.index(
+  { email: 1 },
+  { unique: true, partialFilterExpression: { status: 'pending' } }
+);
 
 export default mongoose.model('CreditPurchaseRequest', creditPurchaseRequestSchema);

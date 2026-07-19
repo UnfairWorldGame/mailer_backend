@@ -32,4 +32,18 @@ export const pdfUpload = multer({
   limits: { fileSize: 25 * 1024 * 1024 },
 });
 
+// Attachments used to be stored as absolute paths, so a campaign whose files
+// were uploaded on one host (e.g. /opt/render/project/src/attachments/x.pdf)
+// fails with ENOENT everywhere else — on Windows it even resolves to
+// C:\opt\render\... New rows store the bare filename; this resolves both.
+export function resolveAttachmentPath(storedPath) {
+  if (!storedPath) return null;
+  const filename = String(storedPath).split(/[\\/]/).pop();
+  const local = path.join(attachmentDir, filename);
+  if (fs.existsSync(local)) return local;
+  // Fall back to the literal stored value so legacy absolute paths still work
+  // when the process really is running on the host that wrote them.
+  return fs.existsSync(storedPath) ? storedPath : local;
+}
+
 export { attachmentDir };

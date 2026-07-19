@@ -3,7 +3,12 @@ import fs from 'fs/promises';
 import path from 'path';
 import mongoose from 'mongoose';
 import rateLimit from 'express-rate-limit';
-import { requireAuth } from '../middleware/auth.js';
+import {
+  requireAuth,
+  requireVerifiedEmail,
+  requireAuthOrResourceToken,
+  signResourceToken,
+} from '../middleware/auth.js';
 import { certUpload } from '../middleware/certUpload.js';
 import { ownerFilter } from '../utils/userScope.js';
 import { toApiDoc, toApiDocs } from '../utils/apiTransform.js';
@@ -20,8 +25,10 @@ import { readSheetRows, matchCertificates, matchCertificatesFromPdfPages } from 
 import {
   startJobSend,
   retryFailedRecipients,
+  countRetryableRecipients,
   cleanupJobFiles,
   syncJobCounters,
+  isJobRunning,
 } from '../services/certificateSendEngine.js';
 import {
   reserveCertificateCredits,
@@ -34,6 +41,68 @@ async function countPending(jobId) {
 }
 
 const router = Router();
+// Registered BEFORE the blanket requireAuth below, deliberately.
+//
+// This route authenticates itself via requireAuthOrResourceToken: a preview
+// opened in a new tab or an <iframe> cannot send an Authorization header, so it
+// carries a short-lived, job-scoped ?t= token instead. While it sat below
+// `router.use(requireAuth)`, that blanket gate rejected every such request with
+// 401 NO_TOKEN before the route's own gate ever ran — so the entire preview
+// path, and the /preview-token endpoint feeding it, were dead. That preview is
+// the review-before-send mitigation for wrong-person matches, so it silently
+// removed the feature's main safety net.
+// Opened as a direct link/new tab, so it also accepts a scoped ?t= token.
+router.get(
+  '/:id/recipients/:recipientId/preview',
+  requireAuthOrResourceToken((req) => `certjob:${req.params.id}:previews`),
+  async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.recipientId)) {
+      return res.status(404).json({ error: 'Certificate not found' });
+    }
+    const job = await loadOwnedJob(req, res);
+    if (!job) return;
+
+    if (job.files_deleted) {
+      return res.status(404).json({ error: 'Certificate files for this job have been cleaned up.' });
+    }
+
+    const recipient = await CertificateRecipient.findOne({ _id: req.params.recipientId, job_id: job._id });
+    if (!recipient || !recipient.matched_file) {
+      return res.status(404).json({ error: 'Certificate not found' });
+    }
+
+    const filePath = pdfPath(job.job_dir, recipient.matched_file);
+    try {
+      await fs.access(filePath);
+    } catch {
+      return res.status(404).json({ error: 'Certificate file not found on server' });
+    }
+
+    const rawName = recipient.original_pdf_name || recipient.matched_file;
+    const asciiName = rawName.replace(/["\r\n]/g, '');
+    // Pin to a server-side allowlist and set nosniff, matching the campaign
+    // attachment route. mime_type is currently magic-byte derived, so this is
+    // not exploitable today — but the value is echoed inline from a route
+    // reachable with only a ?t= token, so it is one careless assignment away
+    // from serving attacker HTML on the API origin.
+    const ALLOWED_PREVIEW_TYPES = new Set(['application/pdf', 'image/png', 'image/jpeg']);
+    const previewType = ALLOWED_PREVIEW_TYPES.has(recipient.mime_type)
+      ? recipient.mime_type
+      : 'application/pdf';
+    res.setHeader('Content-Type', previewType);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(rawName)}`
+    );
+    res.sendFile(path.resolve(filePath));
+  } catch (err) {
+    next(err);
+  }
+  }
+);
+
 router.use(requireAuth);
 
 const uploadLimiter = rateLimit({
@@ -141,6 +210,20 @@ router.post('/upload', uploadLimiter, (req, res, next) => {
       return res.status(400).json({ error: 'Both a certificates ZIP and a recipient sheet are required.' });
     }
 
+    // multer applies ONE limit (maxZipBytes, 500MB) across every field, so
+    // certConfig.maxSheetBytes was defined and never enforced anywhere — a
+    // 500MB workbook reached XLSX.readFile, which parses synchronously and
+    // decompresses the container before any row cap applies, blocking the
+    // event loop for every other request.
+    if (sheetFile.size > certConfig.maxSheetBytes) {
+      await unlinkQuietly(zipFile.path);
+      await unlinkQuietly(sheetFile.path);
+      const limitMb = Math.round(certConfig.maxSheetBytes / (1024 * 1024));
+      return res.status(400).json({
+        error: `The recipient sheet must be ${limitMb}MB or smaller.`,
+      });
+    }
+
     let jobDir = null;
     try {
       // 1) Detect the real file type by signature — extensions are spoofable,
@@ -218,6 +301,7 @@ router.post('/upload', uploadLimiter, (req, res, next) => {
         invalid_email_count: stats.invalid_email,
         duplicate_count: stats.duplicate,
         ambiguous_name_count: stats.ambiguous_name,
+        needs_review_count: stats.needs_review,
         unmatched_pdfs: unmatchedPdfs.slice(0, 500),
         total_recipients: stats.matched,
         pending_count: stats.matched,
@@ -311,6 +395,12 @@ router.get('/:id/recipients', async (req, res, next) => {
 
     if (req.query.match_status) filter.match_status = req.query.match_status;
     if (req.query.send_status) filter.send_status = req.query.send_status;
+    // ?needs_review=1 — matched rows whose pairing was a guess, not an
+    // identification. This is the view the send gate asks the user to check.
+    if (req.query.needs_review === '1') {
+      filter.match_status = 'matched';
+      filter.match_confidence = { $ne: 'exact' };
+    }
 
     const search = String(req.query.search || '').trim();
     if (search) {
@@ -332,46 +422,23 @@ router.get('/:id/recipients', async (req, res, next) => {
   }
 });
 
-// GET /:id/recipients/:recipientId/preview — stream the matched certificate
-// file (PDF, PNG, or JPEG) so the review screen can show/open it before send.
-// Accepts a ?token= query param (see requireAuth) since this is opened as a
-// direct link/new tab rather than fetched with an Authorization header.
-router.get('/:id/recipients/:recipientId/preview', async (req, res, next) => {
+// Short-lived, job-scoped token so preview links opened in a new tab do not
+// carry the session credential in their URL.
+router.get('/:id/recipients/preview-token', async (req, res, next) => {
   try {
-    if (!mongoose.isValidObjectId(req.params.recipientId)) {
-      return res.status(404).json({ error: 'Certificate not found' });
-    }
     const job = await loadOwnedJob(req, res);
     if (!job) return;
-
-    if (job.files_deleted) {
-      return res.status(404).json({ error: 'Certificate files for this job have been cleaned up.' });
-    }
-
-    const recipient = await CertificateRecipient.findOne({ _id: req.params.recipientId, job_id: job._id });
-    if (!recipient || !recipient.matched_file) {
-      return res.status(404).json({ error: 'Certificate not found' });
-    }
-
-    const filePath = pdfPath(job.job_dir, recipient.matched_file);
-    try {
-      await fs.access(filePath);
-    } catch {
-      return res.status(404).json({ error: 'Certificate file not found on server' });
-    }
-
-    const rawName = recipient.original_pdf_name || recipient.matched_file;
-    const asciiName = rawName.replace(/["\r\n]/g, '');
-    res.setHeader('Content-Type', recipient.mime_type || 'application/pdf');
-    res.setHeader(
-      'Content-Disposition',
-      `inline; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(rawName)}`
-    );
-    res.sendFile(path.resolve(filePath));
+    res.json({
+      token: signResourceToken(req.user.id, `certjob:${job._id}:previews`, 600),
+      expires_in: 600,
+    });
   } catch (err) {
     next(err);
   }
 });
+
+// GET /:id/recipients/:recipientId/preview — stream the matched certificate
+// file (PDF, PNG, or JPEG) so the review screen can show/open it before send.
 
 // PATCH /:id — edit the email template / sending options (before or between sends).
 router.patch('/:id', async (req, res, next) => {
@@ -402,7 +469,7 @@ router.patch('/:id', async (req, res, next) => {
 });
 
 // POST /:id/send — begin background delivery.
-router.post('/:id/send', async (req, res, next) => {
+router.post('/:id/send', requireVerifiedEmail, async (req, res, next) => {
   try {
     const job = await loadOwnedJob(req, res);
     if (!job) return;
@@ -415,6 +482,26 @@ router.post('/:id/send', async (req, res, next) => {
     }
     if (job.total_recipients <= 0) {
       return res.status(400).json({ error: 'There are no matched, sendable certificates in this job.' });
+    }
+
+    // Review gate. Certificates are matched to people heuristically, and some
+    // pairings are guesses rather than identifications (matched on an email
+    // local-part, or on document order between same-named recipients). Emailing
+    // one person another person's certificate is not recoverable, so a job
+    // containing any such pairing cannot be sent until the user has explicitly
+    // confirmed they reviewed them. The confirmation is recorded so a later
+    // resume doesn't have to ask again.
+    if (job.needs_review_count > 0 && !job.review_confirmed_at) {
+      if (req.body?.confirm_review !== true) {
+        return res.status(409).json({
+          error:
+            `${job.needs_review_count} certificate${job.needs_review_count !== 1 ? 's were' : ' was'} matched by a best guess rather than a confirmed name. ` +
+            'Review those recipients and confirm before sending.',
+          code: 'REVIEW_REQUIRED',
+          needs_review_count: job.needs_review_count,
+        });
+      }
+      job.review_confirmed_at = new Date();
     }
 
     const accountCount = await GmailAccount.countDocuments(ownerFilter(req.user.id, { is_active: true }));
@@ -505,27 +592,29 @@ router.post('/:id/retry-failed', async (req, res, next) => {
     if (job.files_deleted) {
       return res.status(409).json({ error: 'Certificate files have been cleaned up — cannot retry.' });
     }
-    const requeued = await retryFailedRecipients(job._id);
-    if (requeued === 0) {
+    // Reserve BEFORE requeuing, so a credit shortfall is a clean rejection that
+    // changes nothing. The previous order requeued first and, on QuotaError,
+    // tried to compensate by failing every pending recipient — which swept up
+    // recipients that were already pending and paid for from an earlier run,
+    // destroying them and stranding their reserved credits on a job that could
+    // then only be recovered by deleting it. Reserving first removes the need
+    // for any compensation at all.
+    const retryable = await countRetryableRecipients(job._id);
+    if (retryable === 0) {
       return res.json({ requeued: 0, message: 'No failed certificates to retry.' });
     }
 
-    // Re-reserve credits for the requeued recipients (they were refunded on failure).
     const pending = await countPending(job._id);
     try {
-      await reserveCertificateCredits(req.user.id, job._id, pending);
+      await reserveCertificateCredits(req.user.id, job._id, pending + retryable);
     } catch (err) {
       if (err instanceof QuotaError) {
-        // Roll the recipients back to failed so state stays consistent.
-        await CertificateRecipient.updateMany(
-          { job_id: job._id, send_status: 'pending' },
-          { $set: { send_status: 'failed', error_message: 'Insufficient credits to retry' } }
-        );
-        await syncJobCounters(job._id);
         return res.status(err.status).json({ error: err.message, code: err.code });
       }
       throw err;
     }
+
+    const requeued = await retryFailedRecipients(job._id);
 
     job.status = 'sending';
     if (!job.started_at) job.started_at = new Date();
@@ -582,7 +671,23 @@ router.delete('/:id', async (req, res, next) => {
     const job = await loadOwnedJob(req, res);
     if (!job) return;
 
-    if (['sending', 'ready', 'paused'].includes(job.status)) {
+    // Deleting a live job raced its own workers. This handler released the
+    // reservation and then deleted the PDF directory while senders were still
+    // reading from it: each in-flight worker hit ENOENT, took the permanent-
+    // failure branch, and called releaseCertificateCredits for a reservation
+    // that was already zero — driving reserved_credits negative once per
+    // concurrent worker. A negative reserve *raises* available_to_send, so this
+    // was a repeatable way to mint free sends, on top of the certificates that
+    // silently failed. Pause first, then delete — same rule the campaign route
+    // enforces.
+    if (job.status === 'sending' || isJobRunning(job._id.toString())) {
+      return res.status(409).json({
+        error: 'This job is currently sending. Pause it first, then delete.',
+        code: 'JOB_SENDING',
+      });
+    }
+
+    if (['ready', 'paused'].includes(job.status)) {
       await CertificateJob.updateOne({ _id: job._id }, { $set: { status: 'canceled' } });
     }
 

@@ -29,6 +29,14 @@ const sendLogSchema = new mongoose.Schema(
         'send_retry',
         'duplicate_prevented',
         'campaign_resume',
+        // Written by sendEngine when an App Password is rejected. Its absence
+        // here threw a ValidationError out of the send loop, which the outer
+        // handler turned into "paused after an unexpected error" — the exact
+        // case the auth branch exists to report clearly.
+        'account_auth_failed',
+        // Fallback for an action not yet in this list, so a future typo
+        // degrades to a recorded log line instead of aborting a campaign.
+        'other',
       ],
       required: true,
     },

@@ -29,15 +29,28 @@ export async function createCreditPurchaseRequest(data) {
     throw err;
   }
 
-  return CreditPurchaseRequest.create({
-    email,
-    name: data.name.trim(),
-    phone: data.phone.trim(),
-    pack_label: data.packLabel.trim(),
-    price: data.price?.trim() || null,
-    mails: data.mails?.trim() || null,
-    status: 'pending',
-  });
+  try {
+    return await CreditPurchaseRequest.create({
+      email,
+      name: data.name.trim(),
+      phone: data.phone.trim(),
+      pack_label: data.packLabel.trim(),
+      price: data.price?.trim() || null,
+      mails: data.mails?.trim() || null,
+      status: 'pending',
+    });
+  } catch (err) {
+    // The check above is a read-then-create, which two concurrent submissions
+    // both pass. The unique partial index catches the loser; translate it into
+    // the same friendly error rather than a 500.
+    if (err?.code === 11000) {
+      const dupe = new Error('You already have a pending credit request. Our team will contact you soon.');
+      dupe.code = 'CREDIT_REQUEST_PENDING';
+      dupe.status = 409;
+      throw dupe;
+    }
+    throw err;
+  }
 }
 
 export async function fulfillCreditPurchaseRequests(email) {

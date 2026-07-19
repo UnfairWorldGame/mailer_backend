@@ -17,7 +17,11 @@ router.get('/overview', async (req, res, next) => {
 
 router.get('/emails', async (req, res, next) => {
   try {
-    const days = Math.min(parseInt(req.query.days || '7', 10), 90);
+    // Clamped both ways: Math.min alone let ?days=abc through as NaN (which
+    // becomes an Invalid Date in the $gte of an aggregate stage — mongoose does
+    // not cast pipelines) and ?days=-3650 through as a window 10 years in the
+    // future, returning an empty 200.
+    const days = Math.min(Math.max(Number.parseInt(req.query.days, 10) || 7, 1), 90);
     res.json(await getEmailTimeSeries(req.user.id, days));
   } catch (err) {
     next(err);

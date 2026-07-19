@@ -56,3 +56,9 @@ export function startCertificateSweeper() {
   }, certConfig.sweepIntervalMs);
   timer.unref?.();
 }
+
+export function stopCertificateSweeper() {
+  if (!timer) return;
+  clearInterval(timer);
+  timer = null;
+}

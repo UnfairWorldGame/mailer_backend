@@ -11,7 +11,11 @@ import {
 } from '../config/billingConfig.js';
 import { isAdminUser } from '../utils/adminAccess.js';
 import { fulfillCreditPurchaseRequests } from './creditPurchaseService.js';
-import { sendCreditGrantConfirmationEmail, sendFreeCreditGrantEmail } from './officeEmailService.js';
+import {
+  sendCreditGrantEmail,
+  sendCreditRefundEmail,
+  notifyAdminsOfCreditChange,
+} from './mailer/emails.js';
 import { createNotification } from './notificationService.js';
 import { recordAuditLog } from './auditLogService.js';
 
@@ -48,6 +52,45 @@ function billingFields() {
 
 export function isBillingExempt(user) {
   return isAdminUser(user);
+}
+
+/**
+ * Give back `credits` of reservation without letting the counter dip negative.
+ *
+ * The previous shape was an unguarded `$inc: -N` followed by a *separate*
+ * clamp-to-zero statement. Between those two writes a concurrent reserveCredits
+ * could read a negative reserved_credits, compute an inflated `available`, and
+ * oversell. Guarding the decrement means it either applies in full or not at
+ * all, and the clamp only handles drift that predates this call.
+ */
+async function decrementReserved(userId, credits) {
+  if (credits <= 0) return;
+
+  const applied = await User.updateOne(
+    { _id: userId, reserved_credits: { $gte: credits } },
+    { $inc: { reserved_credits: -credits } }
+  );
+  if (applied.modifiedCount > 0) return;
+
+  // Less reserved than we are releasing — the reconciler's job. Zero it rather
+  // than going negative, and say so, because this means reservations drifted.
+  await User.updateOne(
+    { _id: userId, reserved_credits: { $gt: 0 } },
+    { $set: { reserved_credits: 0 } }
+  );
+}
+
+// Same guard for the per-job reservation counter on a campaign / certificate job.
+async function decrementRefReserved(model, refId, field, credits) {
+  if (!refId || credits <= 0) return;
+
+  const applied = await model.updateOne(
+    { _id: refId, [field]: { $gte: credits } },
+    { $inc: { [field]: -credits } }
+  );
+  if (applied.modifiedCount > 0) return;
+
+  await model.updateOne({ _id: refId, [field]: { $gt: 0 } }, { $set: { [field]: 0 } });
 }
 
 // Atomic daily reset — only the first writer for a new day zeroes the counter.
@@ -94,6 +137,7 @@ export function computeQuotaSnapshot(user) {
       base_rate: BASE_RATE,
       lifetime_credits_used: user.lifetime_credits_used || 0,
       lifetime_credits_received: user.lifetime_credits_received || 0,
+      can_use_paid_features: true,
       plan: 'admin',
       plan_label: 'Admin — Unlimited',
     };
@@ -124,8 +168,14 @@ export function computeQuotaSnapshot(user) {
     base_rate: BASE_RATE,
     lifetime_credits_used: user.lifetime_credits_used || 0,
     lifetime_credits_received: user.lifetime_credits_received || 0,
-    plan: hasPaidAccess ? 'paid' : 'free',
-    plan_label: hasPaidAccess ? 'Paid plan' : 'Free plan',
+    // Authoritative answer to "can this user use AI / insights right now".
+    // Balance-based, so it tracks reality instead of the historical flag —
+    // see middleware/requirePaidFeatures.js for why.
+    can_use_paid_features: available > 0,
+    // has_paid_access now means only "has purchased at some point". It is kept
+    // for reporting and is deliberately NOT what gates features.
+    plan: credits > 0 ? 'paid' : 'free',
+    plan_label: credits > 0 ? 'Paid plan' : 'Free plan',
   };
 }
 
@@ -177,7 +227,13 @@ async function reserveCredits(userId, credits) {
         $gte: [
           {
             $add: [
-              { $subtract: [FREE_DAILY_CREDITS, { $ifNull: ['$free_sent_today', 0] }] },
+              // $max with 0 to match computeQuotaSnapshot, which clamps the same
+              // term. Unclamped, a free_sent_today above FREE_DAILY_CREDITS —
+              // which happens the moment the free daily limit is lowered in
+              // config, since existing counters are not rescaled — made this
+              // term negative and silently ate the user's *paid* credits. The
+              // resulting error contradicted itself: "Need 1, have 5 available".
+              { $max: [0, { $subtract: [FREE_DAILY_CREDITS, { $ifNull: ['$free_sent_today', 0] }] }] },
               { $ifNull: ['$email_credits', 0] },
               { $multiply: [-1, { $ifNull: ['$reserved_credits', 0] }] },
             ],
@@ -219,9 +275,38 @@ async function reserveForRef(userId, { model, refId, field, creditsPerUnit, unit
   const additional = Math.max(0, needed - alreadyReserved);
   if (additional === 0) return { reserved: alreadyReserved };
 
-  await reserveCredits(userId, additional); // throws QuotaError if insufficient
-  await model.updateOne({ _id: refId }, { $inc: { [field]: additional } });
-  return { reserved: alreadyReserved + additional };
+  // Claim the slot on the ref FIRST, conditional on the exact value we read.
+  //
+  // Reading `alreadyReserved` and then reserving + incrementing as two separate
+  // statements is a lost-update race. Two concurrent POST /:id/resume both read
+  // 0, both reserve N, and both $inc the ref to 2N — the status flip to
+  // 'sending' happens after this call, so it does not serialise them. The
+  // reconciler then treats the ref value as authoritative and preserves the
+  // inflated 2N, stranding the user's credits until the job goes terminal.
+  //
+  // With the expected-value filter only one caller can win; the loser sees null
+  // and reports the reservation the winner made.
+  const claimed = await model.findOneAndUpdate(
+    { _id: refId, user_id: userId, [field]: alreadyReserved },
+    { $inc: { [field]: additional } },
+    { new: true }
+  );
+
+  if (!claimed) {
+    const fresh = await model.findOne({ _id: refId, user_id: userId }).select(field).lean();
+    return { reserved: fresh?.[field] || 0, concurrent: true };
+  }
+
+  try {
+    await reserveCredits(userId, additional); // throws QuotaError if insufficient
+  } catch (err) {
+    // The slot is claimed but unfunded — hand it back so the ref does not carry
+    // a reservation the user never paid for.
+    await model.updateOne({ _id: refId }, { $inc: { [field]: -additional } }).catch(() => {});
+    throw err;
+  }
+
+  return { reserved: claimed[field] };
 }
 
 export function reserveCampaignQuota(userId, campaignId, recipientCount) {
@@ -248,30 +333,51 @@ async function consumeCredits(userId, { cost, kind, campaignId = null, jobId = n
 
   let fromFree = 0;
   let fromPaid = 0;
+  let shortfall = 0;
 
   // Spend one credit at a time so each move is a single atomic update. The
   // up-front reservation guarantees the credits exist; this only attributes them.
   for (let i = 0; i < cost; i++) {
+    // The reserved_credits release is deliberately NOT part of these $inc
+    // updates. Neither branch could guard on reserved_credits >= 1 without also
+    // refusing the charge, so a raw -1 drove the field negative whenever the
+    // reservation had already been released underneath us — the classic case
+    // being a stop/cancel landing while a send was in flight. computeQuotaSnapshot
+    // does `available = freeRemaining + credits - reserved`, so a negative
+    // reserved *adds* to the balance: repeat start/stop and you farm free sends.
+    // decrementReserved already clamps at zero, so release through it instead.
     const free = await User.findOneAndUpdate(
       { _id: userId, free_quota_date: today, free_sent_today: { $lt: FREE_DAILY_CREDITS } },
-      { $inc: { free_sent_today: 1, reserved_credits: -1, lifetime_credits_used: 1 } }
+      { $inc: { free_sent_today: 1, lifetime_credits_used: 1 } }
     );
-    if (free) { fromFree++; continue; }
+    if (free) {
+      fromFree++;
+      await decrementReserved(userId, 1);
+      continue;
+    }
 
     const paid = await User.findOneAndUpdate(
       { _id: userId, email_credits: { $gte: 1 } },
-      { $inc: { email_credits: -1, reserved_credits: -1, lifetime_credits_used: 1 } }
+      { $inc: { email_credits: -1, lifetime_credits_used: 1 } }
     );
-    if (paid) { fromPaid++; continue; }
+    if (paid) {
+      fromPaid++;
+      await decrementReserved(userId, 1);
+      continue;
+    }
 
-    // Overflow (should be prevented by reservation) — release the reserved slot.
-    await User.updateOne({ _id: userId }, { $inc: { reserved_credits: -1 } });
+    // Overflow — the reservation said these credits existed and they do not.
+    // Release the reserved slot and record the shortfall so the caller can stop
+    // sending. Silently returning success here is what turns any reservation
+    // drift into an unbounded run of delivered-but-unbilled email, with no
+    // ledger row (the write below is gated on spent > 0) to notice it by.
+    await decrementReserved(userId, 1);
+    shortfall++;
   }
 
-  // Defensive clamp + release the ref reservation for the whole cost.
-  await User.updateOne({ _id: userId, reserved_credits: { $lt: 0 } }, { $set: { reserved_credits: 0 } });
-  if (campaignId) await Campaign.updateOne({ _id: campaignId }, { $inc: { quota_reserved: -cost } });
-  if (jobId) await CertificateJob.updateOne({ _id: jobId }, { $inc: { credits_reserved: -cost } });
+  // Release the ref reservation for the whole cost.
+  await decrementRefReserved(Campaign, campaignId, 'quota_reserved', cost);
+  await decrementRefReserved(CertificateJob, jobId, 'credits_reserved', cost);
 
   const spent = fromFree + fromPaid;
   if (spent > 0) {
@@ -287,7 +393,23 @@ async function consumeCredits(userId, { cost, kind, campaignId = null, jobId = n
     });
   }
 
-  return { source: fromPaid > 0 ? 'paid' : 'free', from_free: fromFree, from_paid: fromPaid, spent };
+  if (shortfall > 0) {
+    console.error(
+      `[quota] user ${userId} was short ${shortfall}/${cost} credit(s) on ${kind} — ` +
+      'the send already went out. Halting the job; reservations are drifting.'
+    );
+  }
+
+  return {
+    source: fromPaid > 0 ? 'paid' : 'free',
+    from_free: fromFree,
+    from_paid: fromPaid,
+    spent,
+    shortfall,
+    // false => the recipient was emailed but could not be fully paid for. The
+    // send engines treat this as a stop condition rather than continuing.
+    charged: shortfall === 0,
+  };
 }
 
 export function consumeSendQuota(userId, campaignId) {
@@ -307,12 +429,8 @@ async function releaseReserved(userId, { model, refId, field, credits }) {
   const user = await User.findById(userId).select('role email');
   if (!user || isBillingExempt(user)) return;
 
-  await User.updateOne({ _id: userId }, { $inc: { reserved_credits: -credits } });
-  await User.updateOne({ _id: userId, reserved_credits: { $lt: 0 } }, { $set: { reserved_credits: 0 } });
-  if (refId) {
-    await model.updateOne({ _id: refId }, { $inc: { [field]: -credits } });
-    await model.updateOne({ _id: refId, [field]: { $lt: 0 } }, { $set: { [field]: 0 } });
-  }
+  await decrementReserved(userId, credits);
+  await decrementRefReserved(model, refId, field, credits);
 }
 
 export function releaseUnsentQuotaSlot(userId, campaignId) {
@@ -330,14 +448,27 @@ async function releaseAllReserved(userId, { model, refId, field, campaignId = nu
     await model.findByIdAndUpdate(refId, { $set: { [field]: 0 } });
     return;
   }
-  const ref = await model.findById(refId);
-  if (!ref) return;
-  const release = ref[field] || 0;
+  // Claim the amount off the ref atomically FIRST, then apply it to the user.
+  //
+  // Reading the amount and then decrementing is a lost-update race, and this
+  // function has two callers that fire for the same ref: the route handler
+  // (stop / delete) and the send loop noticing the status change. Both would
+  // read the same N and both would $inc by -N, so a user running two jobs ends
+  // up with the second job's live reservation silently erased — inflating
+  // available_to_send and letting them queue a send they cannot pay for.
+  //
+  // With the conditional $gt: 0 filter only one caller can win; the loser gets
+  // null and returns without touching the balance.
+  const claimed = await model.findOneAndUpdate(
+    { _id: refId, [field]: { $gt: 0 } },
+    { $set: { [field]: 0 } },
+    { new: false } // pre-image: the amount this caller is responsible for
+  );
+  if (!claimed) return;
+  const release = claimed[field] || 0;
   if (release <= 0) return;
 
-  await User.updateOne({ _id: userId }, { $inc: { reserved_credits: -release } });
-  await User.updateOne({ _id: userId, reserved_credits: { $lt: 0 } }, { $set: { reserved_credits: 0 } });
-  await model.updateOne({ _id: refId }, { $set: { [field]: 0 } });
+  await decrementReserved(userId, release);
 
   await CreditTransaction.create({
     user_id: userId,
@@ -360,42 +491,89 @@ export function releaseCertificateJobReservation(userId, jobId) {
 
 // ── Admin grants / revokes (atomic) ──────────────────────────────────────────
 
+// Claim an idempotency key by writing the ledger row BEFORE moving the balance.
+// The unique partial index on payment_ref means a concurrent duplicate loses
+// here — where nothing has been credited yet — instead of after a second $inc
+// has already handed out free credits. Returns the claimed row; the caller must
+// delete it if the grant then fails, so the key can be retried.
+async function claimGrantLedgerRow(doc) {
+  try {
+    return await CreditTransaction.create(doc);
+  } catch (err) {
+    if (err?.code === 11000) {
+      throw new Error('Credits were already granted for this payment reference');
+    }
+    throw err;
+  }
+}
+
 export async function grantCredits(userId, amount, adminId, meta = {}) {
   const credits = parseInt(amount, 10);
   if (!Number.isFinite(credits) || credits <= 0) {
     throw new Error('Credit amount must be a positive number');
   }
-
-  if (meta.payment_ref) {
-    const duplicate = await CreditTransaction.findOne({ type: 'admin_grant', payment_ref: meta.payment_ref });
-    if (duplicate) throw new Error('Credits were already granted for this payment reference');
+  if (!meta.payment_ref) {
+    throw new Error('A payment reference is required so the same payment cannot be credited twice');
   }
 
-  const user = await User.findOneAndUpdate(
-    { _id: userId },
-    { $inc: { email_credits: credits, lifetime_credits_received: credits }, $set: { has_paid_access: true } },
-    { new: true }
-  );
-  if (!user) return null;
-
-  const transaction = await CreditTransaction.create({
+  const transaction = await claimGrantLedgerRow({
     user_id: userId,
     type: 'admin_grant',
     amount: credits,
-    balance_after: user.email_credits,
+    balance_after: 0, // filled in below once the balance actually moves
     admin_id: adminId,
-    payment_ref: meta.payment_ref || null,
+    payment_ref: meta.payment_ref,
     pack_label: meta.pack_label || null,
     note: meta.note || null,
   });
 
-  const emailResult = await sendCreditGrantConfirmationEmail(user, {
-    creditsGranted: credits,
+  let user;
+  try {
+    user = await User.findOneAndUpdate(
+      { _id: userId },
+      { $inc: { email_credits: credits, lifetime_credits_received: credits }, $set: { has_paid_access: true } },
+      { new: true }
+    );
+  } catch (err) {
+    await CreditTransaction.deleteOne({ _id: transaction._id }).catch(() => {});
+    throw err;
+  }
+
+  if (!user) {
+    // No such user — release the key so a corrected retry can reuse it.
+    await CreditTransaction.deleteOne({ _id: transaction._id }).catch(() => {});
+    return null;
+  }
+
+  transaction.balance_after = user.email_credits;
+  await CreditTransaction.updateOne(
+    { _id: transaction._id },
+    { $set: { balance_after: user.email_credits } }
+  ).catch(() => {});
+
+  // Everything below is a side effect of a grant that has already landed. If
+  // one of them throws, the credits are still in the account — but the caller
+  // sees a failure and will reasonably retry, which is exactly the sequence
+  // that used to double-credit. The unique key now blocks the retry, so the
+  // worst case is a confusing error on a successful grant. Make them
+  // best-effort so the admin gets the truth: the money moved.
+  const emailResult = await sendCreditGrantEmail(user, {
+    credits,
     balanceAfter: user.email_credits,
     packLabel: meta.pack_label || null,
     paymentRef: meta.payment_ref || null,
     note: meta.note || null,
-  });
+  }).catch((err) => ({ sent: false, error: err.message }));
+
+  await notifyAdminsOfCreditChange({
+    user,
+    admin: { id: adminId, name: meta.adminName, email: meta.adminEmail },
+    credits,
+    balanceAfter: user.email_credits,
+    action: 'granted',
+    reference: meta.payment_ref || null,
+    note: meta.note || null,
+  }).catch((err) => console.error('[grant] admin alert failed:', err.message));
 
   await createNotification({
     userId,
@@ -403,7 +581,7 @@ export async function grantCredits(userId, amount, adminId, meta = {}) {
     title: '🎉 Credits added to your account',
     message: `The MailIQ Team has added ${credits.toLocaleString('en-IN')} credits to your account. Your new balance is ${user.email_credits.toLocaleString('en-IN')} credits.`,
     data: { amount: credits, balance_after: user.email_credits, pack_label: meta.pack_label || null },
-  });
+  }).catch((err) => console.error('[grant] notification failed:', err.message));
 
   await recordAuditLog({
     adminId,
@@ -416,9 +594,10 @@ export async function grantCredits(userId, amount, adminId, meta = {}) {
     amount: credits,
     reason: meta.note || null,
     metadata: { pack_label: meta.pack_label || null, payment_ref: meta.payment_ref || null },
-  });
+  }).catch((err) => console.error('[grant] audit log failed:', err.message));
 
-  await fulfillCreditPurchaseRequests(user.email);
+  await fulfillCreditPurchaseRequests(user.email)
+    .catch((err) => console.error('[grant] purchase-request fulfilment failed:', err.message));
 
   return {
     user_id: userId,
@@ -440,22 +619,44 @@ export async function grantFreeCredits(userId, amount, adminId, meta = {}) {
   if (!Number.isFinite(credits) || credits <= 0) {
     throw new Error('Credit amount must be a positive number');
   }
+  if (!meta.request_id) {
+    throw new Error('A request id is required so the same grant cannot be applied twice');
+  }
 
-  const user = await User.findOneAndUpdate(
-    { _id: userId },
-    { $inc: { email_credits: credits, lifetime_credits_received: credits }, $set: { has_paid_access: true } },
-    { new: true }
-  );
-  if (!user) return null;
-
-  const transaction = await CreditTransaction.create({
+  // Free grants are replayable in exactly the same way paid ones are — a
+  // double-clicked button issues two POSTs — so they get the same
+  // database-enforced key, namespaced to keep it distinct from payment refs.
+  const transaction = await claimGrantLedgerRow({
     user_id: userId,
     type: 'admin_free_grant',
     amount: credits,
-    balance_after: user.email_credits,
+    balance_after: 0,
     admin_id: adminId,
+    payment_ref: `free:${meta.request_id}`,
     note: meta.reason || null,
   });
+
+  let user;
+  try {
+    user = await User.findOneAndUpdate(
+      { _id: userId },
+      { $inc: { email_credits: credits, lifetime_credits_received: credits }, $set: { has_paid_access: true } },
+      { new: true }
+    );
+  } catch (err) {
+    await CreditTransaction.deleteOne({ _id: transaction._id }).catch(() => {});
+    throw err;
+  }
+
+  if (!user) {
+    await CreditTransaction.deleteOne({ _id: transaction._id }).catch(() => {});
+    return null;
+  }
+
+  await CreditTransaction.updateOne(
+    { _id: transaction._id },
+    { $set: { balance_after: user.email_credits } }
+  ).catch(() => {});
 
   const congratsMessage =
     `The MailIQ Team has added ${credits.toLocaleString('en-IN')} free credits to your account. ` +
@@ -463,19 +664,33 @@ export async function grantFreeCredits(userId, amount, adminId, meta = {}) {
     'credits help you create and send even more successful email campaigns!' +
     (meta.reason ? ` Reason: ${meta.reason}` : '');
 
+  // Best-effort side effects — see the note in grantCredits. The balance has
+  // already moved; none of these may turn a successful grant into an error.
   await createNotification({
     userId,
     type: 'credit_grant',
     title: '🎉 Congratulations! Free credits added',
     message: congratsMessage,
     data: { amount: credits, balance_after: user.email_credits, reason: meta.reason || null, free: true },
-  });
+  }).catch((err) => console.error('[free-grant] notification failed:', err.message));
 
-  const emailResult = await sendFreeCreditGrantEmail(user, {
-    creditsGranted: credits,
+  const emailResult = await sendCreditGrantEmail(user, {
+    credits,
     balanceAfter: user.email_credits,
-    reason: meta.reason || null,
-  });
+    note: meta.reason || null,
+    paymentRef: `free:${meta.request_id}`,
+    free: true,
+  }).catch((err) => ({ sent: false, error: err.message }));
+
+  await notifyAdminsOfCreditChange({
+    user,
+    admin: { id: adminId, name: meta.adminName, email: meta.adminEmail },
+    credits,
+    balanceAfter: user.email_credits,
+    action: 'granted (free)',
+    reference: `free:${meta.request_id}`,
+    note: meta.reason || null,
+  }).catch((err) => console.error('[free-grant] admin alert failed:', err.message));
 
   await recordAuditLog({
     adminId,
@@ -487,7 +702,7 @@ export async function grantFreeCredits(userId, amount, adminId, meta = {}) {
     targetUserEmail: user.email,
     amount: credits,
     reason: meta.reason || null,
-  });
+  }).catch((err) => console.error('[free-grant] audit log failed:', err.message));
 
   return {
     user_id: userId,
@@ -501,10 +716,35 @@ export async function grantFreeCredits(userId, amount, adminId, meta = {}) {
   };
 }
 
+/**
+ * Remove credits from an account — the refund / correction path.
+ *
+ * This is the only way to reverse money that has moved, so it now carries the
+ * same protections as the grant path it undoes:
+ *
+ *  - `reversal_ref` is a required idempotency key, enforced by the same unique
+ *    index. A double-clicked revoke previously deducted twice.
+ *  - The ledger row is claimed BEFORE the balance moves, so a duplicate loses
+ *    while nothing has been taken yet.
+ *  - Notification and audit writes are best-effort. They used to be unguarded:
+ *    a throw after the $inc landed surfaced a 500, the admin retried, and the
+ *    retry deducted again.
+ *  - Passing `reverses_payment_ref` releases the original grant's idempotency
+ *    key, so a mistaken grant can be corrected and re-issued. Without this a
+ *    revoked payment reference was permanently unusable.
+ *  - `lifetime_credits_received` is decremented, so the lifetime total does not
+ *    permanently overstate what the user actually kept.
+ *
+ * `has_paid_access` is deliberately NOT cleared: it now records only that a
+ * purchase happened, and entitlements are computed from the live balance.
+ */
 export async function revokeCredits(userId, amount, adminId, meta = {}) {
   const credits = parseInt(amount, 10);
   if (!Number.isFinite(credits) || credits <= 0) {
     throw new Error('Credit amount must be a positive number');
+  }
+  if (!meta.reversal_ref) {
+    throw new Error('A reversal reference is required so the same refund cannot be applied twice');
   }
 
   const user = await User.findById(userId).select('name email email_credits reserved_credits has_paid_access');
@@ -516,56 +756,136 @@ export async function revokeCredits(userId, amount, adminId, meta = {}) {
   if (revocable <= 0) {
     throw new Error('No revocable credits — balance may be fully reserved by active jobs');
   }
-  const toRevoke = Math.min(credits, revocable);
-
-  // Atomic conditional decrement so a concurrent send can't drop the balance
-  // below what we revoke.
-  const updated = await User.findOneAndUpdate(
-    { _id: userId, email_credits: { $gte: toRevoke } },
-    { $inc: { email_credits: -toRevoke } },
-    { new: true }
-  );
-  if (!updated) throw new Error('Balance changed — please retry the revoke');
-
-  if (updated.email_credits <= 0) {
-    await User.updateOne({ _id: userId }, { $set: { has_paid_access: false } });
-    updated.has_paid_access = false;
+  if (credits > revocable) {
+    // Previously this silently clamped and reported success for a smaller
+    // number, so an admin refunding 1000 could quietly refund 40 and never
+    // notice. Refuse and state the real figure instead.
+    throw new Error(
+      `Only ${revocable} credit(s) can be removed right now (balance ${balance}, ${reserved} reserved by active jobs).`
+    );
   }
 
-  const transaction = await CreditTransaction.create({
+  const isRefund = Boolean(meta.reverses_payment_ref);
+
+  const transaction = await claimGrantLedgerRow({
     user_id: userId,
-    type: 'admin_revoke',
-    amount: -toRevoke,
-    balance_after: updated.email_credits,
+    type: isRefund ? 'refund' : 'admin_revoke',
+    amount: -credits,
+    balance_after: 0, // filled in below once the balance actually moves
     admin_id: adminId,
+    payment_ref: `revoke:${meta.reversal_ref}`,
     note: meta.note || null,
   });
+
+  let updated;
+  try {
+    updated = await User.findOneAndUpdate(
+      { _id: userId, email_credits: { $gte: credits } },
+      { $inc: { email_credits: -credits, lifetime_credits_received: -credits } },
+      { new: true }
+    );
+  } catch (err) {
+    await CreditTransaction.deleteOne({ _id: transaction._id }).catch(() => {});
+    throw err;
+  }
+
+  if (!updated) {
+    await CreditTransaction.deleteOne({ _id: transaction._id }).catch(() => {});
+    throw new Error('Balance changed — please retry the refund');
+  }
+
+  // lifetime_credits_received must never read negative on a partial history.
+  await User.updateOne(
+    { _id: userId, lifetime_credits_received: { $lt: 0 } },
+    { $set: { lifetime_credits_received: 0 } }
+  ).catch(() => {});
+
+  await CreditTransaction.updateOne(
+    { _id: transaction._id },
+    { $set: { balance_after: updated.email_credits } }
+  ).catch(() => {});
+
+  // Release the original grant's idempotency key so the payment can be
+  // re-credited after a correction.
+  let reversedGrantId = null;
+  if (meta.reverses_payment_ref) {
+    const original = await CreditTransaction.findOneAndUpdate(
+      { user_id: userId, payment_ref: meta.reverses_payment_ref, reversed_at: null },
+      {
+        $set: {
+          reversed_at: new Date(),
+          reversed_ref: meta.reverses_payment_ref,
+          payment_ref: null,
+        },
+      },
+      { new: true }
+    ).catch(() => null);
+
+    if (original) {
+      reversedGrantId = original._id;
+      await CreditTransaction.updateOne(
+        { _id: transaction._id },
+        { $set: { reverses_transaction_id: original._id } }
+      ).catch(() => {});
+    }
+  }
+
+  // Best-effort from here — the balance has already moved and none of these may
+  // turn a completed refund into an error the admin would retry.
+  //
+  // The email is new: a balance reduction previously produced only an in-app
+  // notification, so a user whose credits were removed found out only if they
+  // happened to open the bell menu.
+  await sendCreditRefundEmail(user, {
+    credits,
+    balanceAfter: updated.email_credits,
+    note: meta.note || null,
+    isRefund,
+    reversalRef: meta.reversal_ref,
+  }).catch((err) => console.error('[revoke] user email failed:', err.message));
+
+  await notifyAdminsOfCreditChange({
+    user,
+    admin: { id: adminId, name: meta.adminName, email: meta.adminEmail },
+    credits,
+    balanceAfter: updated.email_credits,
+    action: isRefund ? 'refund' : 'revoke',
+    reference: meta.reversal_ref,
+    note: meta.note || null,
+  }).catch((err) => console.error('[revoke] admin alert failed:', err.message));
 
   await createNotification({
     userId,
     type: 'credit_revoke',
     title: 'Credit balance adjusted',
-    message: `${toRevoke.toLocaleString('en-IN')} credit(s) were removed from your account by an administrator. Your new balance is ${updated.email_credits.toLocaleString('en-IN')} credits.${meta.note ? ` Reason: ${meta.note}` : ''}`,
-    data: { amount: -toRevoke, balance_after: updated.email_credits, reason: meta.note || null },
-  });
+    message: `${credits.toLocaleString('en-IN')} credit(s) were removed from your account by an administrator. Your new balance is ${updated.email_credits.toLocaleString('en-IN')} credits.${meta.note ? ` Reason: ${meta.note}` : ''}`,
+    data: { amount: -credits, balance_after: updated.email_credits, reason: meta.note || null },
+  }).catch((err) => console.error('[revoke] notification failed:', err.message));
 
   await recordAuditLog({
     adminId,
     adminName: meta.adminName || '',
     adminEmail: meta.adminEmail || '',
-    action: 'revoke_credits',
+    action: isRefund ? 'refund_credits' : 'revoke_credits',
     targetUserId: userId,
     targetUserName: user.name,
     targetUserEmail: user.email,
-    amount: toRevoke,
+    amount: credits,
     reason: meta.note || null,
-  });
+    metadata: {
+      reversal_ref: meta.reversal_ref,
+      reverses_payment_ref: meta.reverses_payment_ref || null,
+      reversed_grant_id: reversedGrantId?.toString() || null,
+    },
+  }).catch((err) => console.error('[revoke] audit log failed:', err.message));
 
   return {
     user_id: userId,
-    credits_revoked: toRevoke,
+    credits_revoked: credits,
     email_credits: updated.email_credits,
     has_paid_access: updated.has_paid_access,
+    is_refund: isRefund,
+    reversed_grant_id: reversedGrantId?.toString() || null,
     transaction_id: transaction._id.toString(),
   };
 }

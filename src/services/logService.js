@@ -1,6 +1,17 @@
 import SendLog from '../models/SendLog.js';
 import { toApiDoc } from '../utils/apiTransform.js';
 
+const VALID_ACTIONS = new Set(SendLog.schema.path('action').enumValues);
+const VALID_LEVELS = new Set(SendLog.schema.path('level').enumValues);
+
+/**
+ * Some log rows are load-bearing — reconcileOrphanedSends decides whether a
+ * recipient was already emailed by looking for its `send_success` row — so a
+ * write failure must still surface rather than being swallowed. What must NOT
+ * happen is a *shape* problem (an action missing from the enum) throwing out of
+ * the send loop and taking a live campaign down with it. Coerce anything
+ * unrecognised onto valid values, keeping the original in `details`.
+ */
 export async function writeLog({
   campaignId,
   recipientId = null,
@@ -11,15 +22,28 @@ export async function writeLog({
   recipientEmail = null,
   details = {},
 }) {
+  let safeAction = action;
+  let safeLevel = level;
+  let safeDetails = details;
+
+  if (!VALID_ACTIONS.has(action)) {
+    console.warn(`writeLog: unknown action "${action}" — recording as "other"`);
+    safeAction = 'other';
+    safeDetails = { ...details, original_action: action };
+  }
+  if (!VALID_LEVELS.has(level)) {
+    safeLevel = 'info';
+  }
+
   const log = await SendLog.create({
     campaign_id: campaignId,
     recipient_id: recipientId,
     gmail_account_id: gmailAccountId,
-    level,
-    action,
+    level: safeLevel,
+    action: safeAction,
     message,
     recipient_email: recipientEmail,
-    details,
+    details: safeDetails,
   });
   return log;
 }

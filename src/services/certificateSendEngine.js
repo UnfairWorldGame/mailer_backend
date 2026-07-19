@@ -9,23 +9,47 @@ import {
   AccountRotator,
   isRateLimitError,
   markAccountLimitReached,
+  msUntilAccountReset,
   recordAccountSend,
 } from './accountRotator.js';
 import { getWorkerId } from './campaignTracker.js';
 import { resolvePerAccountDelayMs, sendConfig } from '../config/sendConfig.js';
 import { certConfig } from '../config/certConfig.js';
-import { classifySendError } from '../utils/errorClassifier.js';
+import { classifySendError, isAuthError, describeSendError } from '../utils/errorClassifier.js';
 import { pdfPath, removeJobDir } from './certificateFiles.js';
 import {
   consumeCertificateCredits,
   releaseCertificateCredits,
   releaseCertificateJobReservation,
 } from './quotaService.js';
+import { isShuttingDown, drain } from './shutdown.js';
 
 const activeJobs = new Map();
 const workerId = getWorkerId();
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// In-flight certificate jobs, for graceful shutdown.
+export function awaitActiveCertificateJobs(timeoutMs) {
+  return drain([...activeJobs.values()], timeoutMs);
+}
+
+/**
+ * Sliced sleep so a shutdown signal is seen promptly. A single long timer (the
+ * limit backoff waits tens of seconds) outlived SHUTDOWN_GRACE_MS, so the drain
+ * timed out, the process was killed mid-job, and the job lock then sat stale for
+ * campaignLockStaleMs before anything could pick the job back up.
+ */
+async function sleep(ms) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (isShuttingDown()) return;
+    const slice = Math.min(1000, deadline - Date.now());
+    if (slice <= 0) return;
+    await new Promise((r) => setTimeout(r, slice));
+  }
+}
+
+/** How often the owning process re-stamps a running job's lock. */
+const LOCK_RENEW_INTERVAL_MS = 60000;
 
 const EXT_BY_MIME = { 'application/pdf': '.pdf', 'image/png': '.png', 'image/jpeg': '.jpg' };
 
@@ -91,6 +115,22 @@ async function releaseJobLock(jobId, worker) {
     { _id: jobId, worker_id: worker },
     { $set: { worker_id: null, worker_locked_at: null } }
   );
+}
+
+/**
+ * Heartbeat the job lock while workers are running.
+ *
+ * The lock was stamped once at acquisition and never refreshed, so any job still
+ * sending after campaignLockStaleMs (10 min) looked abandoned: the next instance
+ * to boot cleared it and started a second set of `sendConcurrency` workers on
+ * the same job, doubling the send rate against Gmail's per-account limits.
+ */
+async function renewJobLock(jobId, worker) {
+  const res = await CertificateJob.updateOne(
+    { _id: jobId, worker_id: worker },
+    { $set: { worker_locked_at: new Date() } }
+  );
+  return res.matchedCount > 0;
 }
 
 async function recoverStaleJobLocks() {
@@ -197,19 +237,36 @@ async function jobStatus(jobId) {
   return j;
 }
 
+/** Idle poll interval when nothing is claimable. */
+const IDLE_SLEEP_MS = 3000;
+
 async function sendWorker(jobId, job, rotator, perAccountDelayMs) {
   let consecutiveNoAccount = 0;
+  let foreignWorkerSpins = 0;
+  let idleRounds = 0;
+  let sentSinceSync = 0;
 
   while (true) {
+    // Cooperative shutdown — release the job lock now rather than letting it go
+    // stale. The job stays `sending` and is resumed on the next boot.
+    if (isShuttingDown()) return;
+
     const current = await jobStatus(jobId);
     if (!current) return;
     if (current.status === 'paused') return;
     if (current.status === 'canceled') return;
     if (current.status !== 'sending') return;
     if (current.worker_id && current.worker_id !== workerId) {
+      // Bounded, unlike before: if the holder died without releasing, this
+      // looped for the life of the process, kept the job in activeJobs (making
+      // startJobSend a permanent no-op for it) and burned the whole shutdown
+      // grace period. Yield and let the stale-lock sweep hand it back.
+      foreignWorkerSpins += 1;
+      if (foreignWorkerSpins > 5) return;
       await sleep(perAccountDelayMs);
       continue;
     }
+    foreignWorkerSpins = 0;
 
     const recipient = await claimNextRecipient(jobId, workerId);
     if (!recipient) {
@@ -219,29 +276,87 @@ async function sendWorker(jobId, job, rotator, perAccountDelayMs) {
         job_id: jobId, send_status: { $in: ['pending', 'sending'] },
       });
       if (remaining === 0) return;
-      await sleep(Math.min(perAccountDelayMs, 3000));
+
+      // A row wedged in `sending` — its worker died mid-catch, say — counts as
+      // "remaining" forever, so every worker looped here indefinitely: the job
+      // never completed, finalizeJobIfDone never ran, activeJobs never cleared
+      // (making startJobSend a permanent no-op for it), credits stayed reserved
+      // and files were never cleaned. Recovery only ran at job start, so only a
+      // restart healed it. Re-run it here once the idle stretch exceeds the
+      // claim staleness window, and give up rather than spin forever.
+      idleRounds += 1;
+      if (idleRounds * IDLE_SLEEP_MS >= sendConfig.claimStaleMs) {
+        const recovered = await recoverStaleRecipients(jobId);
+        idleRounds = 0;
+        if (recovered === 0) {
+          // Nothing claimable and nothing recoverable — the remaining rows are
+          // held by live sibling workers. Exit; whoever finishes last completes
+          // the job.
+          return;
+        }
+        continue;
+      }
+
+      await sleep(IDLE_SLEEP_MS);
       continue;
     }
+    idleRounds = 0;
 
     const claimToken = recipient.claim_token;
     const account = await rotator.nextReadyAccount(sleep);
 
     if (!account) {
+      // Wait for the real reset rather than a fixed guess. This used to sleep
+      // 25s ten times and then pause the job — about 4 minutes — while the
+      // hourly cap it was waiting on can be up to 60 minutes out. Any job
+      // larger than the hourly limit per account stalled minutes in and stayed
+      // paused until someone clicked resume.
+      const resets = rotator.orderedAccounts
+        .map((a) => msUntilAccountReset(a))
+        .filter((ms) => ms != null && Number.isFinite(ms));
+
+      if (!resets.length) {
+        // Nothing that will ever come back — pausing is right here.
+        consecutiveNoAccount += 1;
+        if (consecutiveNoAccount >= 3) {
+          await CertificateJob.findOneAndUpdate({ _id: jobId, status: 'sending' }, { $set: { status: 'paused' } });
+          await writeEvent(jobId, { level: 'error', action: 'job_pause', message: 'Paused — no usable Gmail accounts remain. Check your accounts and resume.' });
+          return;
+        }
+        await sleep(perAccountDelayMs);
+        continue;
+      }
+
+      const waitMs = Math.max(perAccountDelayMs, Math.min(...resets) + 1000);
+      consecutiveNoAccount = 0;
+
       await scheduleRetry(recipient._id, claimToken, {
-        nextRetryAt: new Date(Date.now() + perAccountDelayMs * 5),
-        errorMessage: 'All accounts have reached their send limits — waiting to retry.',
+        nextRetryAt: new Date(Date.now() + waitMs),
+        errorMessage: 'All accounts are at their send limit — waiting for the limit to reset.',
       });
-      consecutiveNoAccount += 1;
+
+      // claimNextRecipient increments attempt_count at claim time, before an
+      // account is chosen. Waiting for capacity is not a delivery attempt, and
+      // counting it as one burned the recipient's whole retry budget while
+      // idle: capacity returns, the first real attempt hits one transient
+      // error, and it is permanently failed having never actually been tried.
+      await CertificateRecipient.updateOne(
+        { _id: recipient._id },
+        { $inc: { attempt_count: -1 } }
+      );
       await writeEvent(jobId, {
         recipient_id: recipient._id, level: 'warning', action: 'account_limit_reached',
-        message: 'All Gmail accounts reached their limits. Waiting before retrying.',
+        message: `All Gmail accounts are at their send limit. Waiting ${Math.round(waitMs / 60000)} min for the next reset — the job continues on its own.`,
+        details: { wait_ms: waitMs },
       });
-      if (consecutiveNoAccount >= 10) {
-        await CertificateJob.findOneAndUpdate({ _id: jobId, status: 'sending' }, { $set: { status: 'paused' } });
-        await writeEvent(jobId, { level: 'error', action: 'job_pause', message: 'Paused — all accounts exhausted. Resume after limits reset.' });
-        return;
+
+      // Sleep in chunks so pause/cancel/shutdown are still observed while waiting.
+      const until = Date.now() + waitMs;
+      while (Date.now() < until && !isShuttingDown()) {
+        await sleep(Math.min(30000, until - Date.now()));
+        const check = await jobStatus(jobId);
+        if (!check || check.status !== 'sending') return;
       }
-      await sleep(perAccountDelayMs * 5);
       continue;
     }
     consecutiveNoAccount = 0;
@@ -265,44 +380,135 @@ async function sendWorker(jobId, job, rotator, perAccountDelayMs) {
     });
 
     const attemptStarted = Date.now();
+
+    // Only the sendMail call may route into the failure branch. Everything
+    // after it runs against a message Gmail has already ACCEPTED, and the
+    // failure branch reschedules the recipient — so a throw from the event
+    // write or the finalize used to deliver the same certificate twice (a
+    // transient Atlas blip during writeEvent was enough). Capture the send
+    // error explicitly instead of wrapping the whole block in one try.
+    let info = null;
+    let sendError = null;
     try {
-      const info = await sendCampaignEmail(
+      info = await sendCampaignEmail(
         account,
         { name: recipient.name, email: recipient.email },
         job.subject,
         job.body,
         attachments
       );
+    } catch (err) {
+      sendError = err;
+    }
 
-      // Record success BEFORE finalizing so crash-recovery can dedup.
+    if (!sendError) {
+      // Record success BEFORE finalizing so crash-recovery can dedup:
+      // reconcileOrphanedSends keys off this event to decide a recipient was
+      // already delivered. Best-effort from here on — never throw.
       await writeEvent(jobId, {
         recipient_id: recipient._id, level: 'success', action: 'send_success',
         message: `Certificate delivered to ${recipient.email}`,
         recipient_email: recipient.email,
         details: { message_id: info.messageId, account: account.email, duration_ms: Date.now() - attemptStarted },
-      });
+      }).catch((e) => console.error('cert send_success event failed:', e.message));
 
-      await recordAccountSend(account);
+      await recordAccountSend(account).catch((e) =>
+        console.error('recordAccountSend failed:', e.message)
+      );
       rotator.markSent(account);
 
-      const updated = await finalize(recipient._id, claimToken, {
-        send_status: 'sent', sent_at: new Date(), gmail_account_id: account._id,
-        message_id: info.messageId || null, error_message: null,
-        claim_token: null, claimed_at: null, claimed_by: null,
-      });
+      let updated = null;
+      try {
+        updated = await finalize(recipient._id, claimToken, {
+          send_status: 'sent', sent_at: new Date(), gmail_account_id: account._id,
+          message_id: info.messageId || null, error_message: null,
+          claim_token: null, claimed_at: null, claimed_by: null,
+        });
+      } catch (finalizeErr) {
+        // Delivered but not recorded. Leave the row claimed and move on — the
+        // success event above lets recovery settle it. Retrying would re-send.
+        console.error(
+          `[cert job ${jobId}] delivered to ${recipient.email} but finalize failed:`,
+          finalizeErr.message
+        );
+        continue;
+      }
 
       if (updated) {
         // Charge 3 credits exactly once — only the worker that wins the finalize.
-        await consumeCertificateCredits(job.user_id, jobId);
+        const charge = await consumeCertificateCredits(job.user_id, jobId);
+
+        // Balance ran out despite the reservation. This certificate is already
+        // delivered; pause rather than send the remainder unbilled.
+        if (charge && charge.charged === false) {
+          await CertificateJob.updateOne(
+            { _id: jobId, status: 'sending' },
+            { $set: { status: 'paused' } }
+          );
+          await writeEvent(jobId, {
+            level: 'error', action: 'job_pause',
+            message: 'Job paused — your credit balance ran out mid-send. Top up and resume to continue.',
+            details: { shortfall: charge.shortfall },
+          }).catch(() => {});
+          return;
+        }
       } else {
         await writeEvent(jobId, {
           recipient_id: recipient._id, level: 'warning', action: 'duplicate_prevented',
           message: `Delivered to ${recipient.email} but claim was lost — duplicate prevented`,
           recipient_email: recipient.email,
-        });
+        }).catch(() => {});
       }
-    } catch (err) {
+
+      // Counters were written only at job start and again after every worker
+      // exited, so GET /:id/progress read 0% for the entire run — hours, on a
+      // large job — and then jumped to 100%. last_progress_at never advanced
+      // either, so it was useless as a liveness signal.
+      sentSinceSync += 1;
+      if (sentSinceSync >= sendConfig.progressSyncEvery) {
+        sentSinceSync = 0;
+        await syncJobCounters(jobId).catch(() => {});
+      }
+    } else {
+      const err = sendError;
       const rateLimited = isRateLimitError(err);
+
+      // A rejected App Password is an account problem, not a recipient problem.
+      // Without this branch, EAUTH/535 classified as `permanent`, so every
+      // recipient the bad account happened to be handed was marked failed with
+      // a raw "535-5.7.8 BadCredentials" and never retried on a healthy
+      // account: with 3 accounts and one bad password, a third of the batch
+      // silently never arrived while the job reported "complete".
+      if (isAuthError(err)) {
+        const remaining = rotator.disableForRun(account);
+        await writeEvent(jobId, {
+          recipient_id: recipient._id, level: 'error', action: 'send_failed',
+          message: describeSendError(err, { accountEmail: account.email }),
+          recipient_email: recipient.email,
+          details: { error: err.message, account: account.email, accounts_remaining: remaining },
+        });
+
+        // Hand the recipient back untouched so a healthy account picks it up.
+        await CertificateRecipient.findOneAndUpdate(
+          { _id: recipient._id, claim_token: claimToken },
+          {
+            $set: { send_status: 'pending', claim_token: null, claimed_at: null, claimed_by: null, next_retry_at: null },
+            $inc: { attempt_count: -1 },
+          }
+        );
+
+        if (remaining > 0) continue;
+
+        await CertificateJob.findOneAndUpdate(
+          { _id: jobId, status: 'sending' },
+          { $set: { status: 'paused' } }
+        );
+        await writeEvent(jobId, {
+          level: 'error', action: 'job_pause',
+          message: `Paused — ${describeSendError(err, { accountEmail: account.email })}`,
+        });
+        return;
+      }
       const errorClass = classifySendError(err);
       const canRetry =
         recipient.attempt_count < sendConfig.maxRetriesPerRecipient &&
@@ -385,6 +591,13 @@ async function processJob(jobId) {
   const locked = await tryAcquireJobLock(jobId, workerId);
   if (!locked) return;
 
+  // All `sendConcurrency` workers share one job-level lock, so the heartbeat
+  // lives here rather than in each worker.
+  const heartbeat = setInterval(() => {
+    renewJobLock(jobId, workerId).catch(() => {});
+  }, LOCK_RENEW_INTERVAL_MS);
+  heartbeat.unref?.();
+
   try {
     await recoverStaleRecipients(jobId);
     await reconcileOrphanedSends(jobId);
@@ -435,6 +648,11 @@ async function processJob(jobId) {
     console.error('[cert-job] error:', err.message);
     await CertificateJob.updateOne({ _id: jobId, status: 'sending' }, { $set: { status: 'paused' } }).catch(() => {});
   } finally {
+    clearInterval(heartbeat);
+    // Every early return above (pause, cancel, shutdown, no accounts, files
+    // gone, credit shortfall) skipped finalizeJobIfDone, so the job's counters
+    // stayed as stale as the last periodic sync for as long as it sat paused.
+    await syncJobCounters(jobId).catch(() => {});
     try {
       await releaseJobLock(jobId, workerId);
     } catch { /* ignore on shutdown */ }
@@ -443,16 +661,54 @@ async function processJob(jobId) {
 
 export async function startJobSend(jobId) {
   const id = jobId.toString();
-  if (activeJobs.has(id)) return { alreadyRunning: true };
-  const promise = processJob(id).finally(() => activeJobs.delete(id));
+
+  const existing = activeJobs.get(id);
+  if (existing) {
+    // A job's promise stays in activeJobs until it settles, so a resume that
+    // arrived while the previous run was on its way out got `alreadyRunning`
+    // and the job was left in `sending` with no workers. Chain instead, and
+    // only start again if it still needs sending.
+    const chained = existing
+      .catch(() => {})
+      .then(async () => {
+        const job = await CertificateJob.findById(id).select('status');
+        if (job && job.status === 'sending') return processJob(id);
+      })
+      .finally(() => {
+        if (activeJobs.get(id) === chained) activeJobs.delete(id);
+      });
+    activeJobs.set(id, chained);
+    return { started: true, chained: true };
+  }
+
+  const promise = processJob(id).finally(() => {
+    if (activeJobs.get(id) === promise) activeJobs.delete(id);
+  });
   activeJobs.set(id, promise);
   return { started: true };
 }
 
 // Reset failed recipients back to pending so they can be retried.
+// Filter for recipients a retry may legitimately requeue. The attempt cap
+// matters for cost: without it, a recipient that has already exhausted its
+// retries is requeued anyway, re-reserving 3 credits and burning one more
+// guaranteed-to-fail attempt (the send loop only checks the cap after the
+// attempt). The campaign path has always capped this; this one did not.
+export function retryableRecipientFilter(jobId) {
+  return {
+    job_id: jobId,
+    send_status: 'failed',
+    attempt_count: { $lt: sendConfig.maxRetriesPerRecipient },
+  };
+}
+
+export async function countRetryableRecipients(jobId) {
+  return CertificateRecipient.countDocuments(retryableRecipientFilter(jobId));
+}
+
 export async function retryFailedRecipients(jobId) {
   const res = await CertificateRecipient.updateMany(
-    { job_id: jobId, send_status: 'failed' },
+    retryableRecipientFilter(jobId),
     { $set: { send_status: 'pending', error_message: null, next_retry_at: null, claim_token: null, claimed_at: null, claimed_by: null } }
   );
   if (res.modifiedCount > 0) await syncJobCounters(jobId);

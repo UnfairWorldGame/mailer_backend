@@ -75,3 +75,33 @@ export function classifySendError(err) {
   if (isTransientError(err)) return 'transient';
   return 'unknown';
 }
+
+// Gmail rejects a bad/revoked App Password with 535-5.7.8 BadCredentials. This
+// is a property of the *account*, not the recipient — retrying or moving to the
+// next contact fails identically, so the caller should stop using the account
+// rather than burn the whole recipient list.
+export function isAuthError(err) {
+  if (!err) return false;
+  if (String(err.code || '') === 'EAUTH') return true;
+  if (err.responseCode === 535) return true;
+  return /535[\s-]|badcredentials|username and password not accepted|application-specific password/i.test(
+    err.message || ''
+  );
+}
+
+const ATTACHMENT_MISSING = /ENOENT|no such file or directory/i;
+
+// Raw SMTP/nodemailer strings are unreadable in the campaign UI. Map the cases
+// a user can actually act on to plain instructions; pass anything else through.
+export function describeSendError(err, { accountEmail } = {}) {
+  const raw = err?.message || 'Unknown error';
+  const account = accountEmail ? ` for ${accountEmail}` : '';
+
+  if (isAuthError(err)) {
+    return `Gmail rejected the App Password${account}. Generate a new 16-character App Password at myaccount.google.com/apppasswords and update the account in Settings.`;
+  }
+  if (ATTACHMENT_MISSING.test(raw)) {
+    return 'Attachment file is missing on the server. Re-upload the PDF to this campaign and send again.';
+  }
+  return raw;
+}

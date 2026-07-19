@@ -19,30 +19,99 @@ export function getAccountLimits(account) {
   };
 }
 
+/**
+ * The rotator holds one account document for the whole campaign, and
+ * `recordAccountSend` copies DB-authoritative counters onto it after each
+ * atomic $inc — which marks those paths dirty in Mongoose. A full `account.save()`
+ * here would therefore write this run's snapshot back over increments made by
+ * *other* concurrent campaigns using the same account, undercounting sends and
+ * letting the account blow past Gmail's real cap. Every write below is a
+ * targeted, guarded update for that reason; nothing in this module calls save().
+ */
 export async function resetAccountCountersIfNeeded(account) {
   const now = new Date();
-  let changed = false;
+  const dayStart = startOfDay(now);
+  const hourStart = startOfHour(now);
 
-  if (!account.last_daily_reset || account.last_daily_reset < startOfDay(now)) {
-    account.sends_today = 0;
-    account.last_daily_reset = now;
-    account.limit_reached = false;
-    account.limit_reached_at = null;
-    changed = true;
+  const needsDaily = !account.last_daily_reset || account.last_daily_reset < dayStart;
+  const needsHourly = !account.last_hourly_reset || account.last_hourly_reset < hourStart;
+  if (!needsDaily && !needsHourly) return account;
+
+  if (needsDaily) {
+    // Guarded so that if a parallel worker already rolled the day over, we do
+    // not zero the sends it has recorded since.
+    const fresh = await account.constructor.findOneAndUpdate(
+      {
+        _id: account._id,
+        $or: [{ last_daily_reset: null }, { last_daily_reset: { $lt: dayStart } }],
+      },
+      {
+        $set: {
+          sends_today: 0,
+          last_daily_reset: now,
+          limit_reached: false,
+          limit_reached_at: null,
+        },
+      },
+      { new: true }
+    );
+    applyCounters(account, fresh);
   }
 
-  if (!account.last_hourly_reset || account.last_hourly_reset < startOfHour(now)) {
-    account.sends_this_hour = 0;
-    account.last_hourly_reset = now;
-    if (account.sends_today < getAccountLimits(account).daily) {
-      account.limit_reached = false;
-      account.limit_reached_at = null;
-    }
-    changed = true;
+  if (needsHourly) {
+    const clearLimit = (account.sends_today ?? 0) < getAccountLimits(account).daily;
+    const fresh = await account.constructor.findOneAndUpdate(
+      {
+        _id: account._id,
+        $or: [{ last_hourly_reset: null }, { last_hourly_reset: { $lt: hourStart } }],
+      },
+      {
+        $set: {
+          sends_this_hour: 0,
+          last_hourly_reset: now,
+          ...(clearLimit ? { limit_reached: false, limit_reached_at: null } : {}),
+        },
+      },
+      { new: true }
+    );
+    applyCounters(account, fresh);
   }
 
-  if (changed) await account.save();
   return account;
+}
+
+/** Mirror authoritative DB counters onto the in-memory doc used for availability checks. */
+function applyCounters(account, fresh) {
+  if (!fresh) return;
+  account.sends_today = fresh.sends_today;
+  account.sends_this_hour = fresh.sends_this_hour;
+  account.last_daily_reset = fresh.last_daily_reset;
+  account.last_hourly_reset = fresh.last_hourly_reset;
+  account.limit_reached = fresh.limit_reached;
+  account.limit_reached_at = fresh.limit_reached_at;
+}
+
+/**
+ * Milliseconds until this account's counters next roll over, so callers can wait
+ * for real capacity instead of guessing. Returns null when the account is not
+ * actually capped.
+ */
+export function msUntilAccountReset(account, now = new Date()) {
+  const limits = getAccountLimits(account);
+  const hourlyCapped = (account.sends_this_hour ?? 0) >= limits.hourly;
+  const dailyCapped = (account.sends_today ?? 0) >= limits.daily;
+
+  if (dailyCapped) {
+    const nextDay = startOfDay(now);
+    nextDay.setUTCDate(nextDay.getUTCDate() + 1);
+    return nextDay.getTime() - now.getTime();
+  }
+  if (hourlyCapped || account.limit_reached) {
+    const nextHour = startOfHour(now);
+    nextHour.setUTCHours(nextHour.getUTCHours() + 1);
+    return nextHour.getTime() - now.getTime();
+  }
+  return null;
 }
 
 export function isAccountAvailable(account) {
@@ -55,9 +124,18 @@ export function isAccountAvailable(account) {
 }
 
 export async function markAccountLimitReached(account, reason) {
+  const now = new Date();
+  // Targeted update, not account.save(): recordAccountSend copies DB counters
+  // onto this document, so saving it whole writes this run's snapshot over
+  // increments made by other campaigns and — in the certificate engine, where
+  // sendConcurrency workers share one account doc — by sibling workers. That
+  // silently lowers sends_today and lets the account exceed Gmail's real cap.
+  await account.constructor.updateOne(
+    { _id: account._id },
+    { $set: { limit_reached: true, limit_reached_at: now } }
+  );
   account.limit_reached = true;
-  account.limit_reached_at = new Date();
-  await account.save();
+  account.limit_reached_at = now;
   return { account, reason };
 }
 
@@ -230,6 +308,22 @@ export class AccountRotator {
     return null;
   }
 
+  /**
+   * Drop an account from this run's rotation without touching the DB — used when
+   * Gmail rejects its credentials, so the remaining recipients go to accounts
+   * that can actually authenticate.
+   */
+  disableForRun(account) {
+    const id = account._id.toString();
+    this._ordered = this._ordered.filter((a) => a._id.toString() !== id);
+    if (this._ordered.length) {
+      this.cursor %= this._ordered.length;
+    } else {
+      this.cursor = 0;
+    }
+    return this._ordered.length;
+  }
+
   get orderedAccounts() {
     return this._ordered;
   }
@@ -239,19 +333,45 @@ export class AccountRotator {
   }
 }
 
+/**
+ * Does this error mean *our sending account* was throttled?
+ *
+ * The previous version matched bare substrings ('quota', 'limit', 'exceeded')
+ * against any error message. Gmail answers a recipient with a full mailbox with
+ * "552-5.2.2 The email account that you tried to reach is over quota" — a
+ * permanent, recipient-side 5xx — which that matched, so one bad address marked
+ * the sender's own account limit_reached and pulled it from rotation. With
+ * rotation on, the next account hit the same address and was disabled too,
+ * until every account was burned and the campaign auto-paused.
+ *
+ * So: a 4xx response code is required before any message sniffing, and the
+ * phrases must be sender-side ones.
+ */
+const SENDER_THROTTLE_PATTERNS = [
+  'daily user sending quota exceeded',
+  'daily sending quota',
+  'user-rate limit',
+  'rate limit exceeded',
+  'too many messages',
+  'too many login attempts',
+  'try again later',
+  '4.7.0',
+  '4.7.28',
+];
+
 export function isRateLimitError(err) {
   const msg = (err?.message || '').toLowerCase();
-  const code = err?.responseCode || err?.code;
-  return (
-    code === 421 ||
-    code === 450 ||
-    code === 452 ||
-    code === 454 ||
-    msg.includes('rate') ||
-    msg.includes('limit') ||
-    msg.includes('too many') ||
-    msg.includes('daily') ||
-    msg.includes('quota') ||
-    msg.includes('exceeded')
-  );
+  const responseCode = Number(err?.responseCode);
+
+  // Permanent (5xx) failures are never our throttle, whatever the wording.
+  if (Number.isFinite(responseCode) && responseCode >= 500) return false;
+
+  if ([421, 450, 451, 452, 454].includes(responseCode)) return true;
+
+  // No response code (socket-level failure): fall back to sender-side phrases only.
+  if (!Number.isFinite(responseCode)) {
+    return SENDER_THROTTLE_PATTERNS.some((p) => msg.includes(p));
+  }
+
+  return false;
 }

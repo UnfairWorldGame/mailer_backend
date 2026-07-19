@@ -1,0 +1,101 @@
+# Render Blueprint — the authoritative deployment definition for the MAILIQ API.
+#
+# The live backend runs on Render (mailer-backend-jv0v.onrender.com). Until this
+# file existed, the only record of production configuration was cloudbuild.yaml,
+# which targets Google Cloud Run and is never read by the running service — so
+# editing an env var there looked like a config change and silently did nothing.
+# See deploy/gcp-legacy/README.md.
+#
+# Values marked `sync: false` are secrets: Render prompts for them on first
+# deploy and stores them encrypted. They are intentionally absent here — never
+# commit their values. Everything else is checked in so that intent is
+# reviewable and a rebuilt service can be restored from this file.
+#
+# Apply with: Render Dashboard -> Blueprints -> New Blueprint Instance
+# (or `render blueprint launch` with the Render CLI).
+
+services:
+  - type: web
+    name: mailiq-api
+    runtime: node
+    plan: starter          # NOTE: the free plan sleeps, which stops in-flight
+                           # campaign sends. Any paid plan keeps the send engine
+                           # resident between requests.
+    region: singapore      # closest Render region to the Atlas cluster + users
+    rootDir: backend
+    buildCommand: npm ci --omit=dev
+    startCommand: node src/index.js
+    healthCheckPath: /api/health
+
+    # Render sends SIGTERM before replacing an instance; index.js drains
+    # in-flight sends within SHUTDOWN_GRACE_MS and releases campaign locks.
+    autoDeploy: true
+
+    envVars:
+      # ── Required ──────────────────────────────────────────────────────────
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+
+      # Boot fails fast if this is missing, weak, or a known sample value.
+      - key: JWT_SECRET
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      # Encrypts Gmail App Passwords at rest (AES-256-GCM). If this is unset the
+      # app still boots and stores them in PLAINTEXT — anyone with a database
+      # read then has working send-as-the-user SMTP credentials for every
+      # connected account. Generate with:
+      #   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+      # BACK THE VALUE UP OUTSIDE RENDER FIRST: credentials encrypted with a lost
+      # key are unrecoverable. After setting it, run scripts/encrypt-credentials.mjs
+      # once to convert existing plaintext rows.
+      - key: CREDENTIAL_ENCRYPTION_KEY
+        sync: false
+
+      # Boot fails fast if this is empty in production: an empty CORS allowlist
+      # rejects every browser request while /api/health still returns 200.
+      # Comma-separated; www/non-www variants are expanded automatically.
+      - key: FRONTEND_URL
+        value: https://mailc.netlify.app
+
+      # ── Operational ───────────────────────────────────────────────────────
+      - key: ADMIN_EMAILS
+        value: m87.krishna@gmail.com
+      - key: CONTACT_INBOX_EMAIL
+        value: mailiq.office@gmail.com
+
+      # Transactional mail (password reset, credit-grant confirmations).
+      # Without the app password these silently no-op — users never receive
+      # reset emails and nothing surfaces the failure.
+      - key: PASSWORD_RESET_SMTP_EMAIL
+        value: mailiq.office@gmail.com
+      - key: PASSWORD_RESET_FROM_NAME
+        value: MAILIQ
+      - key: PASSWORD_RESET_SMTP_APP_PASSWORD
+        sync: false
+
+      - key: GEMINI_API_KEY
+        sync: false
+
+    # ── Tuning (defaults in code; uncomment only to override) ───────────────
+    #   Auth/session:   JWT_EXPIRES_IN (7d)
+    #   Shutdown:       SHUTDOWN_GRACE_MS (20000)
+    #   Sending:        GMAIL_PER_ACCOUNT_DELAY_MS (5000)
+    #                   GMAIL_DAILY_LIMIT_PER_ACCOUNT (500)
+    #                   GMAIL_HOURLY_LIMIT_PER_ACCOUNT (100)
+    #                   EMAIL_MAX_RETRIES_PER_RECIPIENT (3)
+    #                   EMAIL_CLAIM_STALE_MS (300000)
+    #                   EMAIL_CAMPAIGN_LOCK_STALE_MS (600000)
+    #   Billing:        FREE_DAILY_CREDITS (100)
+    #                   CREDIT_COST_SIMPLE (1) / CREDIT_COST_CERTIFICATE (3)
+    #                   QUOTA_RECONCILE_INTERVAL_MS (1800000)
+    #                   QUOTA_STALE_RESERVATION_HOURS (72)
+    #   Rate limits:    RATE_LIMIT_MAX, AUTH_RATE_LIMIT_MAX,
+    #                   FORGOT_PASSWORD_RATE_LIMIT_MAX, AI_RATE_LIMIT_MAX,
+    #                   UPLOAD_RATE_LIMIT_MAX, INQUIRY_RATE_LIMIT_MAX,
+    #                   BUY_CREDITS_RATE_LIMIT_MAX, CERT_UPLOAD_RATE_LIMIT_MAX
+    #   Certificates:   CERT_MAX_ZIP_BYTES, CERT_MAX_SINGLE_PDF_BYTES,
+    #                   CERT_MAX_SHEET_BYTES, CERT_MAX_PDF_COUNT, CERT_MAX_ROWS,
+    #                   CERT_READY_TTL_HOURS, CERT_SWEEP_INTERVAL_MS

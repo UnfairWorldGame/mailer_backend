@@ -1,5 +1,6 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { sanitizeEmailHtml, isSafeHttpUrl } from '../utils/sanitizeHtml.js';
+import { canonicalizePlaceholders, hasPlaceholder } from '../utils/personalize.js';
 
 // Input bounds — protect against cost/latency abuse and oversized model calls.
 const MAX_PROMPT_LEN = 4000;
@@ -203,9 +204,21 @@ Return JSON with keys: ${includeSubject ? '"subject" (string), ' : ''}"body" (HT
     throw new Error('AI did not generate email body');
   }
 
+  // The model is asked for {{name}} but reliably drifts to "{{ name }}",
+  // "{{Name}}", or "{{first_name}}". Those look correct in the editor and
+  // preview, then ship literally to the inbox because the send-time substitution
+  // matches only the canonical form. Normalise here, once, at the boundary.
+  const body = canonicalizePlaceholders(sanitizeEmailHtml(parsed.body.trim()));
+  const subject = includeSubject
+    ? canonicalizePlaceholders(clampText(parsed.subject?.trim() || '', MAX_SUBJECT_LEN))
+    : undefined;
+
   return {
-    subject: includeSubject ? clampText(parsed.subject?.trim() || '', MAX_SUBJECT_LEN) : undefined,
-    body: sanitizeEmailHtml(parsed.body.trim()),
+    subject,
+    body,
+    // Lets the client warn that this draft will read the same to everyone,
+    // rather than silently sending an impersonal blast.
+    has_placeholder: hasPlaceholder(`${subject || ''} ${body}`),
   };
 }
 
@@ -264,9 +277,22 @@ Return JSON with keys: "subject" (string), "body" (HTML string)`;
     throw new Error('AI did not return rewritten body');
   }
 
+  // A rewrite is the likeliest place for a placeholder to be mangled — the model
+  // is reformatting text it did not author, and "keep {{name}} intact" is a soft
+  // instruction. Canonicalise so a drifted token still substitutes.
+  const rewrittenBody = canonicalizePlaceholders(sanitizeEmailHtml(parsed.body.trim()));
+  const rewrittenSubject = canonicalizePlaceholders(
+    clampText(parsed.subject?.trim() || subject || '', MAX_SUBJECT_LEN)
+  );
+
   return {
-    subject: clampText(parsed.subject?.trim() || subject || '', MAX_SUBJECT_LEN),
-    body: sanitizeEmailHtml(parsed.body.trim()),
+    subject: rewrittenSubject,
+    body: rewrittenBody,
+    has_placeholder: hasPlaceholder(`${rewrittenSubject} ${rewrittenBody}`),
+    // True when the rewrite dropped a placeholder the original had — the client
+    // surfaces this so a personalised draft is not silently flattened.
+    lost_placeholder: hasPlaceholder(`${subject || ''} ${body || ''}`)
+      && !hasPlaceholder(`${rewrittenSubject} ${rewrittenBody}`),
   };
 }
 

@@ -9,7 +9,15 @@ export const certConfig = {
   // A single multi-page PDF is loaded fully into memory (pdf-lib + pdfjs-dist
   // both need the whole buffer), so it gets a materially smaller cap than the
   // streamed ZIP path.
-  maxSinglePdfBytes: intEnv('CERT_MAX_SINGLE_PDF_BYTES', 200 * 1024 * 1024), // 200MB
+  //
+  // Lowered from 200MB: the splitter buffers the file, copies it again as a
+  // Uint8Array, and then pdf-lib/pdfjs build object graphs typically 3-10x the
+  // file size — so 200MB meant 2-4GB RSS for ONE request, and the parse is
+  // synchronous, so it blocks the event loop for every other tenant while it
+  // runs. 50MB matches the per-certificate cap below and keeps the worst case
+  // survivable on a normal container. Raising this is only safe once splitting
+  // moves to a worker thread with a timeout and an in-flight limit.
+  maxSinglePdfBytes: intEnv('CERT_MAX_SINGLE_PDF_BYTES', 50 * 1024 * 1024), // 50MB
   maxSheetBytes: intEnv('CERT_MAX_SHEET_BYTES', 10 * 1024 * 1024),     // 10MB sheet
   // Real-world certificate PDFs (Canva/Adobe exports with embedded fonts and
   // print-quality images) commonly land in the 10-40MB range — 25MB was too

@@ -7,13 +7,19 @@ import CampaignRecipient from '../models/CampaignRecipient.js';
 import Contact from '../models/Contact.js';
 import GmailAccount from '../models/GmailAccount.js';
 import SendLog from '../models/SendLog.js';
-import { pdfUpload } from '../middleware/pdfUpload.js';
+import { pdfUpload, resolveAttachmentPath } from '../middleware/pdfUpload.js';
 import { hasPdfMagicBytes } from '../utils/fileSignature.js';
 import { startCampaignSend, isCampaignRunning } from '../services/sendEngine.js';
 import { getCampaignLogs, getCampaignLogCount, getRecipientLogs } from '../services/logService.js';
 import { getCampaignProgress, resetFailedRecipients, syncCampaignCounters } from '../services/campaignTracker.js';
-import { requireAuth } from '../middleware/auth.js';
+import {
+  requireAuth,
+  requireVerifiedEmail,
+  requireAuthOrResourceToken,
+  signResourceToken,
+} from '../middleware/auth.js';
 import { toApiDoc, toApiDocs } from '../utils/apiTransform.js';
+import { sanitizeEmailHtml } from '../utils/sanitizeHtml.js';
 import { ownerFilter } from '../utils/userScope.js';
 import { sendConfig, resolvePerAccountDelayMs } from '../config/sendConfig.js';
 import {
@@ -24,7 +30,101 @@ import {
 } from '../services/quotaService.js';
 
 const router = Router();
+// Registered BEFORE the blanket requireAuth below — see the certificate preview
+// route for the full explanation. In short: this route carries its own
+// resource-token gate for <iframe>/new-tab previews that cannot set an
+// Authorization header, and the blanket gate was rejecting them first.
+router.get(
+  '/:id/attachments/:attachmentId/download',
+  requireAuthOrResourceToken((req) => `campaign:${req.params.id}:attachments`),
+  async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id) || !mongoose.isValidObjectId(req.params.attachmentId)) {
+      return res.status(404).json({ error: 'Attachment not found' });
+    }
+
+    const campaign = await findOwnedCampaign(req.user.id, req.params.id);
+    if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+
+    const attachment = campaign.attachments.id(req.params.attachmentId);
+    if (!attachment) return res.status(404).json({ error: 'Attachment not found' });
+
+    const attachmentPath = resolveAttachmentPath(attachment.file_path);
+    if (!fs.existsSync(attachmentPath)) {
+      return res.status(404).json({ error: 'File not found on server' });
+    }
+
+    // original_name is user-supplied (the uploaded file's name) — strip quotes/CR/LF
+    // before embedding it in a header value, and percent-encode the UTF-8 variant.
+    const rawName = attachment.original_name || 'attachment';
+    const asciiName = rawName.replace(/["\r\n]/g, '');
+    // Always application/pdf, never the stored (client-supplied) MIME. Uploads
+    // are accepted on extension OR MIME and the magic-byte check only looks for
+    // '%PDF-' somewhere in the first 1KB, so a file can carry mime_type
+    // 'text/html' — echoing that back with `inline` served attacker HTML from
+    // the API origin. nosniff stops the browser second-guessing us.
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(rawName)}`
+    );
+    res.sendFile(path.resolve(attachmentPath));
+  } catch (err) {
+    next(err);
+  }
+  }
+);
+
 router.use(requireAuth);
+
+/** Per-campaign attachment ceiling — Gmail rejects oversized mail anyway. */
+const MAX_ATTACHMENTS_PER_CAMPAIGN = 10;
+const MAX_ATTACHMENT_BYTES_PER_CAMPAIGN = 25 * 1024 * 1024;
+
+function escapeRegex(term) {
+  return term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const MAX_NAME_LENGTH = 200;
+const MAX_SUBJECT_LENGTH = 500;
+const MAX_BODY_LENGTH = 512 * 1024;
+
+/**
+ * Returns the trimmed, length-capped string, or null when the input is not a
+ * usable string. Callers must treat null as a 400 rather than calling .trim()
+ * directly: `{"name": 123}` used to throw a TypeError here and surface as a 500.
+ */
+function normalizeText(value, max) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return trimmed.slice(0, max);
+}
+
+/**
+ * Campaign bodies were stored exactly as posted and mailed to third parties
+ * unsanitized — sanitizeEmailHtml was only ever applied to AI-generated and
+ * certificate bodies. The frontend sanitizes what it *renders*, which does not
+ * help what lands in a recipient's inbox.
+ */
+function normalizeBody(value) {
+  const trimmed = normalizeText(value, MAX_BODY_LENGTH);
+  if (trimmed === null) return null;
+  const clean = sanitizeEmailHtml(trimmed);
+  return clean.trim() ? clean : null;
+}
+
+/**
+ * Math.max(1, parseInt('abc')) is NaN, not 1 — NaN propagates through both
+ * Math.max and Math.min, so a non-numeric ?page= reached Mongo as skip: NaN and
+ * surfaced as a 500. Clamp explicitly and fall back to the default instead.
+ */
+function parsePositiveInt(value, fallback, min, max) {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
 
 async function findOwnedCampaign(userId, id) {
   if (!mongoose.isValidObjectId(id)) return null;
@@ -69,16 +169,19 @@ router.get('/', async (req, res, next) => {
       filter.status = status;
     }
 
-    if (search?.trim()) {
-      const q = search.trim();
+    if (typeof search === 'string' && search.trim()) {
+      // Escape before it reaches Mongo. Passing the raw query through let a
+      // caller submit a catastrophically-backtracking pattern like (a+)+$ and
+      // pin a mongod core; contactImport.js already escapes the same way.
+      const q = escapeRegex(search.trim().slice(0, 100));
       filter.$or = [
         { name: { $regex: q, $options: 'i' } },
         { subject: { $regex: q, $options: 'i' } },
       ];
     }
 
-    const pageNum = Math.max(1, parseInt(page, 10));
-    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10)));
+    const pageNum = parsePositiveInt(page, 1, 1, Number.MAX_SAFE_INTEGER);
+    const limitNum = parsePositiveInt(limit, 50, 1, 100);
     const skip = (pageNum - 1) * limitNum;
 
     const [campaigns, total] = await Promise.all([
@@ -187,8 +290,8 @@ router.get('/:id/logs', async (req, res, next) => {
     const campaign = await findOwnedCampaign(req.user.id, req.params.id);
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
 
-    const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
-    const skip = parseInt(req.query.skip || '0', 10);
+    const limit = parsePositiveInt(req.query.limit, 100, 1, 500);
+    const skip = parsePositiveInt(req.query.skip, 0, 0, Number.MAX_SAFE_INTEGER);
     const filters = {
       action: req.query.action || undefined,
       level: req.query.level || undefined,
@@ -217,7 +320,11 @@ router.post('/', async (req, res, next) => {
       rotate_accounts,
     } = req.body;
 
-    if (!name?.trim() || !subject?.trim() || !body?.trim()) {
+    const cleanName = normalizeText(name, MAX_NAME_LENGTH);
+    const cleanSubject = normalizeText(subject, MAX_SUBJECT_LENGTH);
+    const cleanBody = normalizeBody(body);
+
+    if (!cleanName || !cleanSubject || !cleanBody) {
       return res.status(400).json({ error: 'Name, subject, and body are required' });
     }
 
@@ -245,9 +352,9 @@ router.post('/', async (req, res, next) => {
 
     const campaign = await Campaign.create({
       user_id: req.user.id,
-      name: name.trim(),
-      subject: subject.trim(),
-      body: body.trim(),
+      name: cleanName,
+      subject: cleanSubject,
+      body: cleanBody,
       gmail_account_id: gmail_account_id || null,
       send_delay_ms: send_delay_ms ?? null,
       rotate_accounts: rotate_accounts !== false,
@@ -289,9 +396,24 @@ router.put('/:id', async (req, res, next) => {
 
     const { name, subject, body, gmail_account_id, send_delay_ms, rotate_accounts } = req.body;
 
-    if (name !== undefined) campaign.name = name.trim();
-    if (subject !== undefined) campaign.subject = subject.trim();
-    if (body !== undefined) campaign.body = body.trim();
+    // Same normalization as POST. This path previously called .trim() straight
+    // on the raw value, so a non-string field threw a TypeError (500), and it
+    // skipped sanitization entirely.
+    if (name !== undefined) {
+      const clean = normalizeText(name, MAX_NAME_LENGTH);
+      if (!clean) return res.status(400).json({ error: 'Campaign name is required' });
+      campaign.name = clean;
+    }
+    if (subject !== undefined) {
+      const clean = normalizeText(subject, MAX_SUBJECT_LENGTH);
+      if (!clean) return res.status(400).json({ error: 'Subject is required' });
+      campaign.subject = clean;
+    }
+    if (body !== undefined) {
+      const clean = normalizeBody(body);
+      if (!clean) return res.status(400).json({ error: 'Email body is required' });
+      campaign.body = clean;
+    }
     if (send_delay_ms !== undefined) campaign.send_delay_ms = send_delay_ms;
     if (rotate_accounts !== undefined) campaign.rotate_accounts = Boolean(rotate_accounts);
 
@@ -324,8 +446,21 @@ router.delete('/:id', async (req, res, next) => {
     const campaign = await findOwnedCampaign(req.user.id, req.params.id);
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
 
+    // Deleting a live campaign raced its own workers: the reservation was
+    // released and the rows hard-deleted while the send loop was mid-flight, so
+    // an email that had already gone out either lost its finalize claim (never
+    // billed) or billed against a deleted campaign, double-decrementing
+    // reserved_credits and leaving a ledger row pointing at nothing.
+    // Stop first, then delete — the certificate flow already works this way.
+    if (campaign.status === 'sending' || isCampaignRunning(campaign._id.toString())) {
+      return res.status(409).json({
+        error: 'This campaign is currently sending. Stop it first, then delete.',
+        code: 'CAMPAIGN_SENDING',
+      });
+    }
+
     for (const att of campaign.attachments || []) {
-      fs.unlink(att.file_path, () => {});
+      fs.unlink(resolveAttachmentPath(att.file_path), () => {});
     }
 
     await releaseCampaignQuota(req.user.id, campaign._id);
@@ -353,7 +488,36 @@ router.get('/:id/attachments', async (req, res, next) => {
   }
 });
 
-router.post('/:id/attachments', pdfUpload.array('files', 10), async (req, res, next) => {
+/**
+ * Multer writes every part to disk before the handler runs, so when *it* fails
+ * — a non-PDF in the batch, LIMIT_FILE_SIZE, a client abort — the handler never
+ * executes and the bytes already written are orphaned forever (there is no
+ * sweeper for the attachments directory). It also rejects with a bare Error, so
+ * errorHandler turned routine user mistakes into 500 "Internal server error".
+ * Clean up and translate to 400 here.
+ */
+function handleAttachmentUpload(req, res, next) {
+  pdfUpload.array('files', MAX_ATTACHMENTS_PER_CAMPAIGN)(req, res, (err) => {
+    if (!err) return next();
+
+    for (const f of req.files || []) fs.unlink(f.path, () => {});
+
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'Each PDF must be 25 MB or smaller' });
+    }
+    if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+      return res.status(400).json({
+        error: `You can attach at most ${MAX_ATTACHMENTS_PER_CAMPAIGN} PDFs`,
+      });
+    }
+    if (err.message === 'Only PDF files are allowed') {
+      return res.status(400).json({ error: err.message });
+    }
+    return next(err);
+  });
+}
+
+router.post('/:id/attachments', handleAttachmentUpload, async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
       for (const f of req.files || []) fs.unlink(f.path, () => {});
@@ -381,12 +545,36 @@ router.post('/:id/attachments', pdfUpload.array('files', 10), async (req, res, n
       return res.status(400).json({ error: 'One or more files are not valid PDFs' });
     }
 
+    // campaign.attachments.push was unbounded, so the only ceiling on disk use
+    // was the global rate limiter. Cap both count and total bytes per campaign.
+    const existing = campaign.attachments || [];
+    const incomingBytes = req.files.reduce((sum, f) => sum + f.size, 0);
+    const existingBytes = existing.reduce((sum, a) => sum + (a.file_size || 0), 0);
+
+    if (existing.length + req.files.length > MAX_ATTACHMENTS_PER_CAMPAIGN) {
+      for (const f of req.files) fs.unlink(f.path, () => {});
+      return res.status(400).json({
+        error: `A campaign can have at most ${MAX_ATTACHMENTS_PER_CAMPAIGN} attachments`,
+      });
+    }
+    if (existingBytes + incomingBytes > MAX_ATTACHMENT_BYTES_PER_CAMPAIGN) {
+      for (const f of req.files) fs.unlink(f.path, () => {});
+      return res.status(400).json({
+        error: 'Attachments for one campaign cannot exceed 25 MB in total',
+      });
+    }
+
     const newAttachments = req.files.map((file) => ({
       original_name: file.originalname,
       stored_name: file.filename,
-      file_path: file.path,
+      // Store the bare filename, not an absolute path — absolute paths do not
+      // survive a move between hosts (or a container redeploy).
+      file_path: file.filename,
       file_size: file.size,
-      mime_type: file.mimetype || 'application/pdf',
+      // Fixed, not file.mimetype: the magic-byte gate above already establishes
+      // the format, and persisting a client-controlled value is what let an
+      // upload dictate the download response's Content-Type.
+      mime_type: 'application/pdf',
     }));
 
     campaign.attachments.push(...newAttachments);
@@ -404,36 +592,21 @@ router.post('/:id/attachments', pdfUpload.array('files', 10), async (req, res, n
   }
 });
 
-router.get('/:id/attachments/:attachmentId/download', async (req, res, next) => {
+// Short-lived token so the previewer can open attachments in a new tab / iframe
+// without putting the session credential in the URL.
+router.get('/:id/attachments/preview-token', async (req, res, next) => {
   try {
-    if (!mongoose.isValidObjectId(req.params.id) || !mongoose.isValidObjectId(req.params.attachmentId)) {
-      return res.status(404).json({ error: 'Attachment not found' });
-    }
-
     const campaign = await findOwnedCampaign(req.user.id, req.params.id);
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
-
-    const attachment = campaign.attachments.id(req.params.attachmentId);
-    if (!attachment) return res.status(404).json({ error: 'Attachment not found' });
-
-    if (!fs.existsSync(attachment.file_path)) {
-      return res.status(404).json({ error: 'File not found on server' });
-    }
-
-    // original_name is user-supplied (the uploaded file's name) — strip quotes/CR/LF
-    // before embedding it in a header value, and percent-encode the UTF-8 variant.
-    const rawName = attachment.original_name || 'attachment';
-    const asciiName = rawName.replace(/["\r\n]/g, '');
-    res.setHeader('Content-Type', attachment.mime_type || 'application/pdf');
-    res.setHeader(
-      'Content-Disposition',
-      `inline; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(rawName)}`
-    );
-    res.sendFile(path.resolve(attachment.file_path));
+    res.json({
+      token: signResourceToken(req.user.id, `campaign:${campaign._id}:attachments`, 600),
+      expires_in: 600,
+    });
   } catch (err) {
     next(err);
   }
 });
+
 
 router.delete('/:id/attachments/:attachmentId', async (req, res, next) => {
   try {
@@ -451,7 +624,7 @@ router.delete('/:id/attachments/:attachmentId', async (req, res, next) => {
     const attachment = campaign.attachments.id(req.params.attachmentId);
     if (!attachment) return res.status(404).json({ error: 'Attachment not found' });
 
-    fs.unlink(attachment.file_path, () => {});
+    fs.unlink(resolveAttachmentPath(attachment.file_path), () => {});
     campaign.attachments.pull(req.params.attachmentId);
     await campaign.save();
 
@@ -493,8 +666,16 @@ router.post('/:id/retry-failed', async (req, res, next) => {
     const campaign = await findOwnedCampaign(req.user.id, req.params.id);
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
 
-    if (!['completed', 'failed', 'paused', 'stopped', 'sending'].includes(campaign.status)) {
-      return res.status(400).json({ error: 'Cannot retry failed emails for a draft campaign' });
+    // 'sending' is deliberately excluded. A live worker polls for pending
+    // recipients continuously, so requeuing into a running campaign lets it
+    // start sending them before this handler has reserved anything — and the
+    // reservation failing afterwards can no longer call them back. Pause first.
+    if (!['completed', 'failed', 'paused', 'stopped'].includes(campaign.status)) {
+      return res.status(400).json({
+        error: campaign.status === 'sending'
+          ? 'Pause the campaign before retrying failed emails.'
+          : 'Cannot retry failed emails for a draft campaign',
+      });
     }
 
     const { reset_attempts: resetAttempts } = req.body || {};
@@ -505,23 +686,33 @@ router.post('/:id/retry-failed', async (req, res, next) => {
       );
     }
 
-    const retried = await resetFailedRecipients(campaign._id, {
-      maxRetries: sendConfig.maxRetriesPerRecipient,
-    });
-
-    if (retried === 0) {
+    // Reserve BEFORE requeuing. Doing it the other way round makes the credit
+    // check advisory: the rows are already pending (and claimable) by the time
+    // the reservation is evaluated, so a 402 response is returned to the user
+    // while the emails go out anyway.
+    const retryFilter = {
+      campaign_id: campaign._id,
+      status: 'failed',
+      attempt_count: { $lt: sendConfig.maxRetriesPerRecipient },
+    };
+    const retryable = await CampaignRecipient.countDocuments(retryFilter);
+    if (retryable === 0) {
       return res.status(400).json({ error: 'No failed recipients to retry' });
     }
 
     try {
       const outstanding = await countOutstandingRecipients(campaign._id);
-      await reserveCampaignQuota(req.user.id, campaign._id, outstanding);
+      await reserveCampaignQuota(req.user.id, campaign._id, outstanding + retryable);
     } catch (err) {
       if (err instanceof QuotaError) {
         return res.status(err.status).json({ error: err.message, code: err.code });
       }
       throw err;
     }
+
+    const retried = await resetFailedRecipients(campaign._id, {
+      maxRetries: sendConfig.maxRetriesPerRecipient,
+    });
 
     if (campaign.status !== 'sending') {
       campaign.status = 'sending';
@@ -540,7 +731,7 @@ router.post('/:id/retry-failed', async (req, res, next) => {
   }
 });
 
-router.post('/:id/send', async (req, res, next) => {
+router.post('/:id/send', requireVerifiedEmail, async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(404).json({ error: 'Campaign not found' });
@@ -613,7 +804,7 @@ router.post('/:id/pause', async (req, res, next) => {
   }
 });
 
-router.post('/:id/resume', async (req, res, next) => {
+router.post('/:id/resume', requireVerifiedEmail, async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(404).json({ error: 'Campaign not found' });

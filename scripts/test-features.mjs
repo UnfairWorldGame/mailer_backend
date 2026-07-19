@@ -46,7 +46,7 @@ async function authenticate() {
   // Create a throwaway user directly and sign a token the same way login does,
   // rather than going through the HTTP register/verify flow.
   const { default: User } = await import('../src/models/User.js');
-  const { signToken } = await import('../src/middleware/auth.js');
+  const { signAccessToken } = await import('../src/middleware/auth.js');
 
   // Against a real (non-memory-server) MONGODB_URI, a leftover user from a
   // previous run would collide on the unique email index — clear it first so
@@ -58,7 +58,9 @@ async function authenticate() {
     password: 'Test-Password-123!',
   });
   testUserId = user._id;
-  authToken = signToken(user._id);
+  // signAccessToken takes the user document, not an id: the payload pins
+  // token_version so a password change invalidates tokens already issued.
+  authToken = signAccessToken(user);
 }
 
 async function setupDb() {
@@ -289,11 +291,10 @@ async function testRetryFailedRespectsMaxRetries() {
     await CampaignRecipient.findByIdAndUpdate(retryable._id, {
       $set: { status: 'failed', error_message: 'transient', attempt_count: sendConfig.maxRetriesPerRecipient - 1 },
     });
-    // Pretend a send loop is already active (status 'sending') so the route's
-    // `if (campaign.status !== 'sending') startCampaignSend(...)` branch is
-    // skipped — otherwise this kicks off a real async send against the fake
-    // test Gmail account and the resulting race makes this assertion flaky.
-    await Campaign.findByIdAndUpdate(campaignId, { status: 'sending', failed_count: 2 });
+    // 'paused' is the state the route supports: retrying into a *running*
+    // campaign is rejected on purpose, because the live worker could claim the
+    // requeued rows before the credit reservation is evaluated.
+    await Campaign.findByIdAndUpdate(campaignId, { status: 'paused', failed_count: 2 });
 
     const { res, data } = await request(`/campaigns/${campaignId}/retry-failed`, {
       method: 'POST',
@@ -301,17 +302,241 @@ async function testRetryFailedRespectsMaxRetries() {
     });
     if (!res.ok) throw new Error(data.error);
 
+    // The route restarts the send loop, which immediately starts claiming the
+    // rows it just requeued. So assert on what the cap guarantees rather than
+    // on an exact status: the exhausted recipient must never be picked up (the
+    // loop only claims 'pending'), and the retryable one must have left 'failed'.
     const exhaustedAfter = await CampaignRecipient.findById(exhausted._id);
     if (exhaustedAfter.status !== 'failed') {
       throw new Error(`recipient at max retries was requeued (status=${exhaustedAfter.status})`);
     }
     const retryableAfter = await CampaignRecipient.findById(retryable._id);
-    if (retryableAfter.status !== 'pending') {
-      throw new Error(`recipient under retry cap was not requeued (status=${retryableAfter.status})`);
+    if (retryableAfter.status === 'failed') {
+      throw new Error('recipient under retry cap was not requeued');
+    }
+
+    // Drain before the next test so this loop doesn't race its fixtures.
+    await Campaign.findByIdAndUpdate(campaignId, { status: 'stopped' });
+    for (let i = 0; i < 50 && isCampaignRunning(campaignId); i++) {
+      await new Promise((r) => setTimeout(r, 100));
     }
     pass('POST /campaigns/:id/retry-failed respects max_retries_per_recipient');
   } catch (err) {
     fail('POST /campaigns/:id/retry-failed respects max_retries_per_recipient', err);
+  }
+}
+
+async function testAppPasswordEncryptedAtRest() {
+  // Gmail App Passwords are live SMTP credentials that send as the user, so a
+  // database read must not yield usable ones. Verify three things: the raw
+  // stored value is ciphertext, the application still reads back cleartext, and
+  // serializing the document never exposes the field.
+  try {
+    const GmailAccount = (await import('../src/models/GmailAccount.js')).default;
+    const { isEncrypted, isCredentialEncryptionConfigured, resetCredentialKeyCache } =
+      await import('../src/utils/credentialCrypto.js');
+
+    // Deterministic regardless of the developer's environment: encryption
+    // downgrades to plaintext when no key is set, so provide one for this test.
+    if (!isCredentialEncryptionConfigured()) {
+      const crypto = await import('crypto');
+      process.env.CREDENTIAL_ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
+      resetCredentialKeyCache();
+    }
+
+    const secret = 'abcd efgh ijkl mnop';
+    const account = await GmailAccount.create({
+      user_id: testUserId,
+      label: 'Crypto Test',
+      email: 'crypto-test@gmail.com',
+      app_password: secret,
+    });
+
+    // 1. What actually sits in Mongo, read without the schema getter.
+    const raw = await mongoose.connection
+      .collection('gmailaccounts')
+      .findOne({ _id: account._id }, { projection: { app_password: 1 } });
+
+    if (!isEncrypted(raw.app_password)) {
+      throw new Error('app_password is stored in plaintext');
+    }
+    if (raw.app_password.includes('abcdefghijklmnop')) {
+      throw new Error('plaintext secret is present in the stored value');
+    }
+
+    // 2. The application still gets a usable credential (whitespace stripped).
+    const loaded = await GmailAccount.findById(account._id);
+    if (loaded.app_password !== 'abcdefghijklmnop') {
+      throw new Error(`decrypted value did not round-trip (got ${loaded.app_password})`);
+    }
+
+    // 3. Serialization never carries it, whatever a route forgets to strip.
+    if ('app_password' in loaded.toJSON()) throw new Error('toJSON exposes app_password');
+    if ('app_password' in loaded.toObject()) throw new Error('toObject exposes app_password');
+
+    // 4. Re-saving must not double-encrypt.
+    loaded.label = 'Crypto Test 2';
+    await loaded.save();
+    const reloaded = await GmailAccount.findById(account._id);
+    if (reloaded.app_password !== 'abcdefghijklmnop') {
+      throw new Error('re-saving the document corrupted the stored credential');
+    }
+
+    await GmailAccount.deleteOne({ _id: account._id });
+    pass('Gmail App Passwords are encrypted at rest and redacted from output');
+  } catch (err) {
+    fail('Gmail App Passwords are encrypted at rest and redacted from output', err);
+  }
+}
+
+async function testSignatoryNameIsNotMatchedAsHolder() {
+  // Regression test for the worst outcome this product has: emailing one person
+  // another person's certificate. Role words ('coordinator', 'director', ...)
+  // are whitelisted as name boundaries, so a signatory's printed name read as a
+  // clean holder match. If that signatory is also an attendee in the sheet and
+  // no other sheet name is extractable from the page, the page matched them
+  // exclusively and was labelled 'exact' — bypassing the needs-review gate.
+  try {
+    const { matchCertificatesFromPdfPages } = await import('../src/utils/certMatch.js');
+
+    const pages = [
+      {
+        page_number: 1,
+        stored_name: 'p1.pdf',
+        size: 1000,
+        // Awarded to someone who is NOT in the sheet; signed by someone who is.
+        text: 'Certificate of Participation awarded to Priya Sharma for attending the workshop. Ravi Menon Coordinator',
+      },
+    ];
+    const rows = [{ name: 'Ravi Menon', email: 'ravi@example.com' }];
+
+    const result = matchCertificatesFromPdfPages(rows, pages);
+    const ravi = result.recipients.find((r) => r.email === 'ravi@example.com');
+
+    if (ravi && ravi.match_status === 'matched') {
+      throw new Error(
+        `signatory was matched as the certificate holder (confidence=${ravi.match_confidence})`
+      );
+    }
+    pass('a signatory name is not matched as the certificate holder');
+  } catch (err) {
+    fail('a signatory name is not matched as the certificate holder', err);
+  }
+}
+
+async function testHolderNameStillMatches() {
+  // Guard against overcorrection: the ordinary layout — holder's name as a
+  // heading, a signatory elsewhere — must still match cleanly.
+  try {
+    const { matchCertificatesFromPdfPages } = await import('../src/utils/certMatch.js');
+
+    const pages = [{
+      page_number: 1,
+      stored_name: 'p1.pdf',
+      size: 1000,
+      text: 'Certificate of Participation awarded to Priya Sharma for attending the workshop. Ravi Menon Coordinator',
+    }];
+    const rows = [{ name: 'Priya Sharma', email: 'priya@example.com' }];
+
+    const result = matchCertificatesFromPdfPages(rows, pages);
+    const priya = result.recipients.find((r) => r.email === 'priya@example.com');
+
+    if (!priya || priya.match_status !== 'matched') {
+      throw new Error(`the real holder was not matched (status=${priya?.match_status})`);
+    }
+    pass('the certificate holder is still matched normally');
+  } catch (err) {
+    fail('the certificate holder is still matched normally', err);
+  }
+}
+
+async function testConsumeNeverDrivesReservedNegative() {
+  // Regression test: a stop/cancel releasing the reservation while a send is
+  // still in flight used to leave consumeSendQuota decrementing reserved_credits
+  // below zero. computeQuotaSnapshot subtracts `reserved` from available, so a
+  // negative value *raised* the balance — repeat start/stop to farm free sends.
+  try {
+    const User = (await import('../src/models/User.js')).default;
+    const { consumeSendQuota, reserveCampaignQuota, releaseCampaignQuota, getQuotaDateKey } =
+      await import('../src/services/quotaService.js');
+    const { FREE_DAILY_CREDITS } = await import('../src/config/billingConfig.js');
+
+    await User.findByIdAndUpdate(testUserId, {
+      $set: {
+        email_credits: 5,
+        reserved_credits: 0,
+        // Exactly at the free limit (not above it) so the paid branch is taken
+        // without the free term going negative.
+        free_sent_today: FREE_DAILY_CREDITS,
+        free_quota_date: getQuotaDateKey(),
+        role: 'user',
+      },
+    });
+
+    await reserveCampaignQuota(testUserId, campaignId, 1);
+    // The race: reservation released (stop/cancel) before the in-flight send
+    // reports back.
+    await releaseCampaignQuota(testUserId, campaignId);
+    await consumeSendQuota(testUserId, campaignId);
+
+    const after = await User.findById(testUserId).select('reserved_credits email_credits');
+    if (after.reserved_credits < 0) {
+      throw new Error(`reserved_credits went negative (${after.reserved_credits})`);
+    }
+    if (after.email_credits !== 4) {
+      throw new Error(`expected the credit to still be charged, got ${after.email_credits}`);
+    }
+    // Restore a clean billing state — later tests reserve against this user.
+    await User.findByIdAndUpdate(testUserId, {
+      $set: { email_credits: 100, reserved_credits: 0, free_sent_today: 0 },
+    });
+    pass('consumeSendQuota charges without driving reserved_credits negative');
+  } catch (err) {
+    fail('consumeSendQuota charges without driving reserved_credits negative', err);
+  }
+}
+
+async function testStaleReservationSweepCoversTerminalStates() {
+  // Regression test: the sweep filtered on an inclusion list of
+  // ['paused','stopped','failed'], so credits stranded on a 'completed' campaign
+  // (loop finished, process died before releaseCampaignQuota) were never
+  // returned — and reconcileReservations re-asserted them on every pass.
+  try {
+    const User = (await import('../src/models/User.js')).default;
+    const Campaign = (await import('../src/models/Campaign.js')).default;
+    const { reserveCampaignQuota } = await import('../src/services/quotaService.js');
+    const { reconcileReservations } = await import('../src/services/quotaReconciler.js');
+
+    await User.findByIdAndUpdate(testUserId, {
+      $set: { email_credits: 10, reserved_credits: 0 },
+    });
+
+    const stranded = await Campaign.create({
+      user_id: testUserId,
+      name: 'Stranded reservation',
+      subject: 'x',
+      body: '<p>x</p>',
+      status: 'completed',
+    });
+    await reserveCampaignQuota(testUserId, stranded._id, 4);
+
+    // Age it past the staleness cutoff.
+    await Campaign.updateOne(
+      { _id: stranded._id },
+      { $set: { updated_at: new Date(Date.now() - 100 * 60 * 60 * 1000) } },
+      { timestamps: false }
+    );
+
+    await reconcileReservations();
+
+    const after = await Campaign.findById(stranded._id).select('quota_reserved');
+    if ((after?.quota_reserved ?? 0) !== 0) {
+      throw new Error(`completed campaign still holds ${after.quota_reserved} reserved credit(s)`);
+    }
+    await Campaign.deleteOne({ _id: stranded._id });
+    pass('stale reservations are swept from terminal-state campaigns');
+  } catch (err) {
+    fail('stale reservations are swept from terminal-state campaigns', err);
   }
 }
 
@@ -503,6 +728,11 @@ async function main() {
     await testRetryFailedRespectsMaxRetries();
     await testLogsWithFilters();
     await testResumeInterrupted();
+    await testAppPasswordEncryptedAtRest();
+    await testSignatoryNameIsNotMatchedAsHolder();
+    await testHolderNameStillMatches();
+    await testConsumeNeverDrivesReservedNegative();
+    await testStaleReservationSweepCoversTerminalStates();
     await testCampaignDeleteReleasesReservedCredits();
     await testPersonalizeEscapesHtml();
     await testPdfMagicByteValidation();

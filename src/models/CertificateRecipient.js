@@ -34,6 +34,20 @@ const certificateRecipientSchema = new mongoose.Schema(
     },
     match_note: { type: String, default: '' },
 
+    // How much to trust a 'matched' row. Only 'exact' is a positive
+    // identification; the other two are educated guesses that are still
+    // sendable but must be confirmed by a human first (see the review gate in
+    // routes/certificates.js).
+    //  exact          — the recipient's name matched the certificate outright
+    //  email_fallback — matched on the email local-part, not the name
+    //  name_order     — one of several same-named people, paired by document order
+    match_confidence: {
+      type: String,
+      enum: ['exact', 'email_fallback', 'name_order'],
+      default: 'exact',
+      index: true,
+    },
+
     // Delivery state. Only sendable rows start as 'pending'; others are 'skipped'.
     send_status: {
       type: String,

@@ -104,6 +104,26 @@ export async function tryAcquireCampaignLock(campaignId, worker) {
   return campaign;
 }
 
+/**
+ * Refresh the lock's heartbeat while a send loop is actively working.
+ *
+ * `tryAcquireCampaignLock` stamps `worker_locked_at` once. Nothing renewed it,
+ * so a campaign still sending after `campaignLockStaleMs` (10 min) looked
+ * abandoned: the next instance to boot cleared the lock and started a *second*
+ * loop over the same campaign, doubling the send rate against Gmail's
+ * per-account limits.
+ *
+ * Returns false when the lock now belongs to someone else — the caller should
+ * stop rather than keep sending behind another worker's back.
+ */
+export async function renewCampaignLock(campaignId, worker) {
+  const result = await Campaign.updateOne(
+    { _id: campaignId, worker_id: worker },
+    { $set: { worker_locked_at: new Date() } }
+  );
+  return result.matchedCount > 0;
+}
+
 export async function releaseCampaignLock(campaignId, worker) {
   await Campaign.findOneAndUpdate(
     { _id: campaignId, worker_id: worker },

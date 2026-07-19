@@ -9,6 +9,11 @@ import mongoose from 'mongoose';
 import { resolveUserRole } from '../utils/adminAccess.js';
 import { toApiDoc } from '../utils/apiTransform.js';
 import { computeQuotaSnapshot, listCreditTransactions } from './quotaService.js';
+import {
+  sendRoleChangedEmail,
+  sendAccountStatusEmail,
+  notifyAdminsOfAccountChange,
+} from './mailer/emails.js';
 import { CREDIT_PACKS } from '../config/billingConfig.js';
 import { recordAuditLog } from './auditLogService.js';
 
@@ -417,8 +422,12 @@ export async function listActivity({ page = 1, limit = 30, level = '' } = {}) {
   };
 }
 
-export async function listUsers({ page = 1, limit = 20, search = '', role = '', status = '', credits = '' } = {}) {
-  const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+export async function listUsers({ page = 1, limit = 20, search = '', role = '', status = '', credits = '', forExport = false } = {}) {
+  // The CSV export asked for 1000 and silently received 100, then reported
+  // "Exported 100 users" as though that were the whole set. Exports get a
+  // higher ceiling; interactive pages stay at 100.
+  const maxLimit = forExport ? 5000 : 100;
+  const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 20, 1), maxLimit);
   const safePage = Math.max(parseInt(page, 10) || 1, 1);
   const filter = {};
   const and = [];
@@ -522,6 +531,10 @@ export async function listUsers({ page = 1, limit = 20, search = '', role = '', 
 }
 
 export async function getUserDetail(userId) {
+  // A malformed id threw a CastError, which errorHandler maps to a 500 —
+  // "Internal server error" for what is simply a bad URL.
+  if (!mongoose.isValidObjectId(userId)) return null;
+
   const user = await User.findById(userId)
     .select('name email role is_active created_at updated_at email_credits free_sent_today free_quota_date reserved_credits has_paid_access')
     .lean();
@@ -587,6 +600,7 @@ export async function getUserDetail(userId) {
 
 export async function updateUser(userId, updates, actingAdmin) {
   const actingAdminId = typeof actingAdmin === 'object' ? actingAdmin?.id : actingAdmin;
+  if (!mongoose.isValidObjectId(userId)) return null;
   const user = await User.findById(userId);
   if (!user) return null;
 
@@ -601,16 +615,6 @@ export async function updateUser(userId, updates, actingAdmin) {
 
   const demotingAdmin = user.role === 'admin' && updates.role === 'user';
   const disablingAdmin = user.role === 'admin' && user.is_active !== false && updates.is_active === false;
-  if (demotingAdmin || disablingAdmin) {
-    const remainingAdmins = await User.countDocuments({
-      _id: { $ne: user._id },
-      role: 'admin',
-      is_active: { $ne: false },
-    });
-    if (remainingAdmins === 0) {
-      throw new Error('You cannot remove the last remaining admin account');
-    }
-  }
 
   const prevRole = user.role;
   const prevActive = user.is_active;
@@ -623,10 +627,43 @@ export async function updateUser(userId, updates, actingAdmin) {
     user.is_active = Boolean(updates.is_active);
   }
 
-  await user.save();
+  if (demotingAdmin || disablingAdmin) {
+    // Count-then-write is a TOCTOU race: two concurrent demotions of the final
+    // two admins each observe one *other* admin remaining and both commit,
+    // leaving zero admins and no way back in without database access.
+    //
+    // Writing conditionally on the count still being satisfied closes it — the
+    // second writer's filter no longer matches, so it fails instead of
+    // committing. Re-checked after the write for the same reason.
+    const remainingAdmins = await User.countDocuments({
+      _id: { $ne: user._id },
+      role: 'admin',
+      is_active: { $ne: false },
+    });
+    if (remainingAdmins === 0) {
+      throw new Error('You cannot remove the last remaining admin account');
+    }
+
+    await user.save();
+
+    const stillHaveAdmin = await User.countDocuments({ role: 'admin', is_active: { $ne: false } });
+    if (stillHaveAdmin === 0) {
+      // A concurrent update removed the other admin between our check and our
+      // write. Roll back rather than leave the platform locked out.
+      user.role = prevRole;
+      user.is_active = prevActive;
+      await user.save();
+      throw new Error('You cannot remove the last remaining admin account');
+    }
+  } else {
+    await user.save();
+  }
+
+  const roleChanged = updates.role !== undefined && user.role !== prevRole;
+  const statusChanged = updates.is_active !== undefined && user.is_active !== prevActive;
 
   if (actingAdminId && typeof actingAdmin === 'object') {
-    if (updates.role !== undefined && user.role !== prevRole) {
+    if (roleChanged) {
       await recordAuditLog({
         adminId: actingAdminId,
         adminName: actingAdmin.name || '',
@@ -636,9 +673,9 @@ export async function updateUser(userId, updates, actingAdmin) {
         targetUserName: user.name,
         targetUserEmail: user.email,
         metadata: { from: prevRole, to: user.role },
-      });
+      }).catch((err) => console.error('[admin] role audit failed:', err.message));
     }
-    if (updates.is_active !== undefined && user.is_active !== prevActive) {
+    if (statusChanged) {
       await recordAuditLog({
         adminId: actingAdminId,
         adminName: actingAdmin.name || '',
@@ -648,8 +685,37 @@ export async function updateUser(userId, updates, actingAdmin) {
         targetUserName: user.name,
         targetUserEmail: user.email,
         metadata: { from: prevActive, to: user.is_active },
-      });
+      }).catch((err) => console.error('[admin] status audit failed:', err.message));
     }
+  }
+
+  // Both changes were previously silent: a suspended user simply started being
+  // rejected with no explanation, and an admin promotion/demotion was invisible
+  // to the person it happened to. Queued through the outbox, so a mail failure
+  // cannot fail the account change that already committed.
+  if (roleChanged) {
+    sendRoleChangedEmail(user, { role: user.role }).catch((err) =>
+      console.error('[admin] role email failed:', err.message)
+    );
+    notifyAdminsOfAccountChange({
+      user,
+      admin: actingAdmin,
+      change: user.role === 'admin' ? 'promoted to admin' : 'demoted to user',
+      detail: `${prevRole} → ${user.role}`,
+    }).catch((err) => console.error('[admin] role alert failed:', err.message));
+  }
+
+  if (statusChanged) {
+    sendAccountStatusEmail(user, {
+      active: user.is_active !== false,
+      reason: updates.reason || null,
+    }).catch((err) => console.error('[admin] status email failed:', err.message));
+    notifyAdminsOfAccountChange({
+      user,
+      admin: actingAdmin,
+      change: user.is_active === false ? 'suspended' : 'reactivated',
+      detail: updates.reason || null,
+    }).catch((err) => console.error('[admin] status alert failed:', err.message));
   }
 
   return publicUser(user);

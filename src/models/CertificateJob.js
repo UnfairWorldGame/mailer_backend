@@ -48,6 +48,12 @@ const certificateJobSchema = new mongoose.Schema(
     duplicate_count: { type: Number, default: 0 },
     ambiguous_name_count: { type: Number, default: 0 }, // rows sharing a name we couldn't safely auto-match
 
+    // Matched rows whose match_confidence is not 'exact' — sendable, but the
+    // pairing is a guess. While this is > 0 the send route refuses to start
+    // until the user explicitly confirms they have reviewed the matches.
+    needs_review_count: { type: Number, default: 0 },
+    review_confirmed_at: { type: Date, default: null },
+
     // PDFs that matched no CSV row (kept for the review screen only).
     unmatched_pdfs: { type: [String], default: [] },
 
@@ -80,5 +86,12 @@ const certificateJobSchema = new mongoose.Schema(
 
 certificateJobSchema.index({ user_id: 1, created_at: -1 });
 certificateJobSchema.index({ status: 1, worker_locked_at: 1 });
+// The quota reconciler sweeps live reservations every 30 minutes and the admin
+// analytics aggregate on them; without this both are collection scans. Partial
+// so it only covers the handful of jobs actually holding credits.
+certificateJobSchema.index(
+  { credits_reserved: 1, status: 1 },
+  { partialFilterExpression: { credits_reserved: { $gt: 0 } } }
+);
 
 export default mongoose.model('CertificateJob', certificateJobSchema);

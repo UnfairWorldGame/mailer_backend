@@ -4,6 +4,8 @@ import GmailAccount from '../models/GmailAccount.js';
 import { requireAuth } from '../middleware/auth.js';
 import { toApiDoc, toApiDocs } from '../utils/apiTransform.js';
 import { ownerFilter } from '../utils/userScope.js';
+import { verifyAccountConnection } from '../services/emailService.js';
+import { describeSendError, isAuthError } from '../utils/errorClassifier.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -47,18 +49,39 @@ router.post('/', async (req, res, next) => {
       return res.status(400).json({ error: 'Label, email, and app password are required' });
     }
 
+    const cleanEmail = email.trim().toLowerCase();
+
+    // Uniqueness is per user, so a duplicate here always means *this* user
+    // already has this address. Say that, and point at the deactivated case —
+    // an inactive account is invisible in the default list, so "already
+    // registered" looked like a phantom conflict.
+    const existing = await GmailAccount.findOne(ownerFilter(req.user.id, { email: cleanEmail }));
+    if (existing) {
+      return res.status(409).json({
+        error: existing.is_active
+          ? 'You have already added this Gmail account.'
+          : 'You already have this Gmail account, but it is deactivated. Reactivate it instead of adding it again.',
+        code: existing.is_active ? 'ACCOUNT_EXISTS' : 'ACCOUNT_EXISTS_INACTIVE',
+        account_id: existing._id.toString(),
+      });
+    }
+
     const account = await GmailAccount.create({
       user_id: req.user.id,
       label: label.trim(),
-      email: email.trim().toLowerCase(),
+      email: cleanEmail,
       app_password: app_password.trim(),
       daily_send_limit: daily_send_limit || null,
     });
 
     res.status(201).json(publicAccount(account));
   } catch (err) {
+    // Backstop for the race the check above cannot close.
     if (err.code === 11000) {
-      return res.status(409).json({ error: 'This email is already registered' });
+      return res.status(409).json({
+        error: 'You have already added this Gmail account.',
+        code: 'ACCOUNT_EXISTS',
+      });
     }
     next(err);
   }
@@ -85,8 +108,38 @@ router.put('/:id', async (req, res, next) => {
     res.json(publicAccount(account));
   } catch (err) {
     if (err.code === 11000) {
-      return res.status(409).json({ error: 'This email is already registered' });
+      return res.status(409).json({
+        error: 'You already have another Gmail account using that address.',
+        code: 'ACCOUNT_EXISTS',
+      });
     }
+    next(err);
+  }
+});
+
+// Lets a user confirm an App Password actually authenticates before committing a
+// campaign to it — a rejected password otherwise only surfaces mid-send.
+router.post('/:id/verify', async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    const account = await GmailAccount.findOne(ownerFilter(req.user.id, { _id: req.params.id }));
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+
+    try {
+      await verifyAccountConnection(account);
+    } catch (err) {
+      return res.status(400).json({
+        ok: false,
+        error: describeSendError(err, { accountEmail: account.email }),
+        code: isAuthError(err) ? 'GMAIL_AUTH_FAILED' : 'GMAIL_CONNECTION_FAILED',
+      });
+    }
+
+    res.json({ ok: true, message: `${account.email} authenticated successfully` });
+  } catch (err) {
     next(err);
   }
 });
